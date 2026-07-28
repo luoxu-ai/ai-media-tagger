@@ -1,0 +1,56 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Prepare dependencies
+        shell: powershell
+        run: .\prepare.ps1
+
+      - name: Run tests
+        shell: powershell
+        run: .\.venv\Scripts\python.exe -m pytest -q
+
+      - name: Build executable
+        shell: powershell
+        run: .\build.ps1
+
+      - name: Create SHA-256 checksum
+        shell: powershell
+        run: |
+          $exe = Get-ChildItem .\dist -Filter *.exe | Select-Object -First 1
+          if (-not $exe) { throw "Built executable was not found." }
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe.FullName).Hash
+          "$hash  $($exe.Name)" | Set-Content -Encoding ASCII .\dist\SHA256SUMS.txt
+
+      - name: Upload unsigned build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-media-tagger-windows-unsigned
+          path: |
+            dist/*.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
