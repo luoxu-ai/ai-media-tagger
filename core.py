@@ -15,6 +15,7 @@ from typing import Iterable
 
 
 APP_NAME = "AI 媒体标签工具"
+APP_VERSION = "1.1.0"
 TAG_VALUE = "contains-synthetic-performer"
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".mp4"}
 FILE_RETRY_DELAYS = (0.5, 1.0, 2.0)
@@ -300,6 +301,91 @@ class ExifToolService:
         except subprocess.TimeoutExpired:
             return {
                 str(path).casefold(): TagResult(path, False, "批量处理超时（180 秒）")
+                for path in ordered
+            }
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return {
+                str(path).casefold(): TagResult(path, False, str(exc))
+                for path in ordered
+            }
+
+    def remove_target_subject(self, path: Path) -> TagResult:
+        """Remove only the fixed disclosure keyword and verify the result."""
+        last_result = TagResult(path, False, "标签移除未执行")
+        for attempt in range(len(FILE_RETRY_DELAYS) + 1):
+            try:
+                written = self._run([
+                    "-charset", "filename=UTF8", "-overwrite_original",
+                    f"-XMP-dc:Subject-={TAG_VALUE}", str(path),
+                ])
+                if written.returncode != 0:
+                    detail = (written.stderr or written.stdout).strip()
+                    last_result = TagResult(path, False, detail or "ExifTool 移除标签失败")
+                else:
+                    readable, values, detail = self._read_subject(path)
+                    if not readable:
+                        last_result = TagResult(path, False, f"标签移除后验证失败：{detail}")
+                    elif TAG_VALUE in values:
+                        last_result = TagResult(path, False, "验证时目标标签仍然存在")
+                    else:
+                        return TagResult(path, True, "目标标签已移除并验证；其他关键词已保留")
+            except subprocess.TimeoutExpired:
+                last_result = TagResult(path, False, "处理超时（180 秒）")
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                last_result = TagResult(path, False, str(exc))
+            if attempt >= len(FILE_RETRY_DELAYS) or not _is_transient_file_error(last_result.message):
+                return last_result
+            time.sleep(FILE_RETRY_DELAYS[attempt])
+        return last_result
+
+    def remove_target_subjects_batch(
+        self, paths: Iterable[Path]
+    ) -> dict[str, TagResult]:
+        """Remove and verify the fixed keyword for many files efficiently."""
+        ordered = list(paths)
+        if not ordered:
+            return {}
+        try:
+            written = self._run([
+                "-charset", "filename=UTF8", "-overwrite_original",
+                f"-XMP-dc:Subject-={TAG_VALUE}",
+                *(str(path) for path in ordered),
+            ])
+            write_detail = (written.stderr or written.stdout).strip()
+            states = self.read_subjects(ordered)
+            results: dict[str, TagResult] = {}
+            for path in ordered:
+                key = str(path).casefold()
+                readable, values, detail = states[key]
+                if readable and TAG_VALUE not in values:
+                    results[key] = TagResult(
+                        path, True, "目标标签已批量移除并验证；其他关键词已保留"
+                    )
+                elif not readable:
+                    results[key] = TagResult(
+                        path, False,
+                        f"批量移除后验证失败：{detail or write_detail or '未知错误'}",
+                    )
+                else:
+                    results[key] = TagResult(
+                        path, False,
+                        f"批量验证时目标标签仍然存在；{write_detail}",
+                    )
+
+            # Preserve fault isolation for files temporarily locked by
+            # Explorer, antivirus or sync software.
+            for path in ordered:
+                key = str(path).casefold()
+                if results[key].success:
+                    continue
+                time.sleep(0.2)
+                retried = self.remove_target_subject(path)
+                if retried.success:
+                    results[key] = retried
+            return results
+        except subprocess.TimeoutExpired:
+            return {
+                str(path).casefold(): TagResult(path, False, "批量清理超时（180 秒）")
                 for path in ordered
             }
         except (OSError, ValueError, json.JSONDecodeError) as exc:

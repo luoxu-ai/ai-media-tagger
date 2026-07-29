@@ -10,6 +10,8 @@ a = Analysis(
         ('.\\assets\\app-icon.ico', 'assets'),
         ('.\\models\\dfine_m_human_parts_trial.onnx', 'models'),
         ('.\\models\\face_detection_yunet_2023mar.onnx', 'models'),
+        ('.\\models\\presence_classifier_efficientnet_b0.onnx', 'models'),
+        ('.\\models\\presence_classifier_verifier_final.onnx', 'models'),
     ],
     hiddenimports=[],
     hookspath=[],

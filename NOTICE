@@ -1,5 +1,5 @@
 AI Media Tag Tool
-Copyright 2026 Shenzhen Airunte Trading Co., Ltd.
+Copyright 2026 luoxu-ai contributors.
 
 This product includes software and model files developed by third parties.
 See THIRD_PARTY_NOTICES.md for attribution and license information.
@@ -7,4 +7,3 @@ See THIRD_PARTY_NOTICES.md for attribution and license information.
 The bundled human detector is a fine-tuned derivative of D-FINE-M.
 The bundled face detector is YuNet from OpenCV Zoo.
 Media metadata is read and written with ExifTool by Phil Harvey.
-

@@ -118,6 +118,38 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(attempt.call_count, 3)
         self.assertEqual(sleep.call_count, 2)
+
+    def test_removes_only_target_subject_and_verifies(self):
+        service = ExifToolService(Path("exiftool.exe"))
+        completed = type("Result", (), {"returncode": 0, "stdout": "updated", "stderr": ""})()
+        with patch.object(service, "_run", return_value=completed) as run, patch.object(
+            service, "_read_subject", return_value=(True, ["other-keyword"], "")
+        ):
+            result = service.remove_target_subject(Path("demo.jpg"))
+        self.assertTrue(result.success)
+        arguments = run.call_args.args[0]
+        self.assertIn(f"-XMP-dc:Subject-={TAG_VALUE}", arguments)
+        self.assertNotIn(f"-XMP-dc:Subject+={TAG_VALUE}", arguments)
+        self.assertIn("其他关键词已保留", result.message)
+
+    def test_batch_removes_target_subject_with_one_write_and_one_verification(self):
+        service = ExifToolService(Path("exiftool.exe"))
+        paths = [Path("中文甲_AI.jpg"), Path("中文乙_AI.png")]
+        completed = type("Result", (), {"returncode": 0, "stdout": "updated", "stderr": ""})()
+        verified = {
+            str(path).casefold(): (True, ["other-keyword"], "") for path in paths
+        }
+        with patch.object(service, "_run", return_value=completed) as run, patch.object(
+            service, "read_subjects", return_value=verified
+        ) as read:
+            results = service.remove_target_subjects_batch(paths)
+        self.assertEqual(run.call_count, 1)
+        read.assert_called_once_with(paths)
+        self.assertTrue(all(result.success for result in results.values()))
+        arguments = run.call_args.args[0]
+        self.assertIn(f"-XMP-dc:Subject-={TAG_VALUE}", arguments)
+        self.assertNotIn(f"-XMP-dc:Subject+={TAG_VALUE}", arguments)
+
     @patch("core.subprocess.run")
     def test_batch_finds_files_that_already_have_target_subject(self, run):
         run.return_value = type(
