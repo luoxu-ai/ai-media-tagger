@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Windows executable
 
 on:
   workflow_dispatch:
@@ -11,9 +11,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-2022
-    timeout-minutes: 30
-
+    runs-on: windows-latest
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -24,33 +22,39 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Prepare dependencies
-        shell: powershell
+      - name: Prepare pinned dependencies and ExifTool
+        shell: pwsh
         run: .\prepare.ps1
 
-      - name: Run tests
-        shell: powershell
+      - name: Run automated tests
+        shell: pwsh
         run: .\.venv\Scripts\python.exe -m pytest -q
 
-      - name: Build executable
-        shell: powershell
+      - name: Build Windows executable
+        shell: pwsh
         run: .\build.ps1
 
       - name: Create SHA-256 checksum
-        shell: powershell
+        shell: pwsh
         run: |
-          $exe = Get-ChildItem .\dist -Filter *.exe | Select-Object -First 1
-          if (-not $exe) { throw "Built executable was not found." }
-          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe.FullName).Hash
-          "$hash  $($exe.Name)" | Set-Content -Encoding ASCII .\dist\SHA256SUMS.txt
+          $executable = 'dist\AI媒体标签工具.exe'
+          if (-not (Test-Path -LiteralPath $executable)) {
+            throw "Build output is missing: $executable"
+          }
+          $hash = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  AI媒体标签工具.exe" | Set-Content -LiteralPath 'dist\SHA256.txt' -Encoding ascii
 
-      - name: Upload unsigned build
+      - name: Upload unsigned build artifact
+        id: upload
         uses: actions/upload-artifact@v4
         with:
           name: ai-media-tagger-windows-unsigned
           path: |
-            dist/*.exe
-            dist/SHA256SUMS.txt
+            dist/AI媒体标签工具.exe
+            dist/SHA256.txt
           if-no-files-found: error
-          retention-days: 30
 
+      # After SignPath Foundation approval, the artifact ID from the upload
+      # step will be submitted with signpath/github-action-submit-signing-request.
+      # Organization/project/policy identifiers are intentionally not guessed
+      # or committed before SignPath provisions the OSS subscription.
