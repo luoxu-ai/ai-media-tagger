@@ -1,5 +1,6 @@
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -8,6 +9,7 @@ from update_manager import (
     ReleaseInfo,
     UpdateCancelled,
     UpdateError,
+    authenticode_status,
     download_release,
     consume_update_startup_result,
     is_installable_signature_status,
@@ -33,6 +35,23 @@ def test_only_valid_or_explicitly_unsigned_installers_can_continue():
     assert not is_installable_signature_status("HashMismatch")
     assert not is_installable_signature_status("NotTrusted")
     assert not is_installable_signature_status("UnknownError")
+
+
+def test_authenticode_status_passes_unicode_path_through_environment(monkeypatch):
+    target = Path(r"C:\测试目录\AI媒体标签工具安装程序.exe")
+    captured = {}
+
+    def fake_run(arguments, **kwargs):
+        captured["arguments"] = arguments
+        captured["environment"] = kwargs["env"]
+        return SimpleNamespace(stdout="NotSigned\n")
+
+    monkeypatch.setattr("update_manager.os.name", "nt")
+    monkeypatch.setattr("update_manager.subprocess.run", fake_run)
+
+    assert authenticode_status(target) == "NotSigned"
+    assert str(target) not in captured["arguments"]
+    assert captured["environment"]["AI_MEDIA_TAGGER_SIGNATURE_PATH"] == str(target)
 
 
 def test_release_payload_prefers_the_official_installer_asset():
