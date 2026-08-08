@@ -65,6 +65,29 @@ class ModelUnavailableError(RuntimeError):
     pass
 
 
+def default_detection_cache_path() -> Path:
+    root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    return root / "AI媒体标签工具" / "detection_cache.json"
+
+
+def detection_cache_file_info() -> tuple[int, int]:
+    """Return cached entry count and file size without loading any model."""
+    path = default_detection_cache_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        entries = payload.get("entries", {})
+        count = len(entries) if isinstance(entries, dict) else 0
+        return count, path.stat().st_size
+    except (OSError, ValueError, AttributeError):
+        return 0, 0
+
+
+def clear_detection_cache_file() -> None:
+    path = default_detection_cache_path()
+    path.unlink(missing_ok=True)
+    path.with_suffix(".tmp").unlink(missing_ok=True)
+
+
 def _clamp_box(box: np.ndarray) -> tuple[float, float, float, float]:
     x1, y1, x2, y2 = (float(value) for value in box)
     x1, x2 = sorted((min(640.0, max(0.0, x1)), min(640.0, max(0.0, x2))))
@@ -269,8 +292,20 @@ class PersonDetector:
 
     @staticmethod
     def _default_cache_path() -> Path:
-        root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-        return root / "AI媒体标签工具" / "detection_cache.json"
+        return default_detection_cache_path()
+
+    def cache_info(self) -> tuple[int, int]:
+        cache = getattr(self, "_cache", {})
+        try:
+            size = self.cache_path.stat().st_size
+        except OSError:
+            size = 0
+        return len(cache) if isinstance(cache, dict) else 0, size
+
+    def clear_cache(self) -> None:
+        self._cache = {}
+        self._cache_dirty = 0
+        clear_detection_cache_file()
 
     def _load_cache(self) -> dict[str, dict]:
         path = getattr(self, "cache_path", None)

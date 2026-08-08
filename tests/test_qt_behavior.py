@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import Qt
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QAbstractItemView
+from PySide6.QtWidgets import QApplication, QAbstractItemView, QWidget
 
 from core import TagResult
 from person_detector import DetectionResult
@@ -206,6 +206,28 @@ class QtBehaviorTests(unittest.TestCase):
         finally:
             dialog.close()
 
+    def test_windows_title_bar_uses_the_effective_app_theme(self):
+        window = QWidget()
+        try:
+            hwnd = int(window.winId())
+            with (
+                patch.object(qt_app.os, "name", "nt"),
+                patch.object(qt_app, "effective_theme", return_value="dark"),
+                patch.object(
+                    qt_app, "_set_windows_immersive_dark_mode", return_value=True
+                ) as setter,
+            ):
+                self.assertTrue(qt_app.apply_windows_title_bar_theme(window))
+                setter.assert_called_once_with(hwnd, True)
+        finally:
+            window.close()
+
+    def test_title_bar_filter_is_installed_only_once(self):
+        qt_app.install_windows_title_bar_theme_filter(self.app)
+        installed = self.app._windows_title_bar_theme_filter
+        qt_app.install_windows_title_bar_theme_filter(self.app)
+        self.assertIs(self.app._windows_title_bar_theme_filter, installed)
+
     def test_file_list_replaces_combined_add_file_empty_state(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "商品图.jpg"
@@ -269,7 +291,9 @@ class QtBehaviorTests(unittest.TestCase):
                     self.assertIn("上一次任务", window.log_lines)
                     window.log_lines.append("追加结果")
                     window._persist_log()
-                    self.assertIn("追加结果", latest.read_text(encoding="utf-8-sig"))
+                    content = latest.read_text(encoding="utf-8-sig")
+                    self.assertIn("追加结果", content)
+                    self.assertEqual(content.count("上一次任务"), 1)
                 finally:
                     window.close()
 
@@ -753,6 +777,10 @@ class QtBehaviorTests(unittest.TestCase):
                 window._set_file_status(paths[0], "已导出", "success")
                 window._set_file_status(paths[1], "未检测到人物", "skipped")
                 window._set_file_status(paths[2], "处理失败", "failure")
+                self.assertEqual(window.status_filter_buttons["all"].text(), "全部 4")
+                self.assertEqual(window.status_filter_buttons["exported"].text(), "已导出 1")
+                self.assertEqual(window.status_filter_buttons["skipped"].text(), "未检测 1")
+                self.assertEqual(window.status_filter_buttons["failure"].text(), "失败 1")
 
                 window._set_status_filter("exported")
                 self.assertEqual(
@@ -844,6 +872,22 @@ class QtBehaviorTests(unittest.TestCase):
             self.assertIn("公司：深圳市艾润特贸易有限公司", text)
         finally:
             dialog.close()
+
+    def test_main_window_exposes_keyboard_shortcuts_and_privacy_safe_diagnostics(self):
+        window = MainWindow()
+        try:
+            self.assertIn("Ctrl+O", window.choose_file_button.toolTip())
+            self.assertIn("Ctrl+Shift+O", window.choose_folder_button.toolTip())
+            with (
+                patch("qt_app.runtime_environment_issues", return_value=[]),
+                patch("qt_app.detection_cache_file_info", return_value=(12, 1024)),
+            ):
+                diagnostics = window.system_diagnostics_text()
+            self.assertIn("检测缓存：12 条", diagnostics)
+            self.assertIn("不包含图片、文件名或本机路径", diagnostics)
+            self.assertNotIn(str(Path.home()), diagnostics)
+        finally:
+            window.close()
 
 
 if __name__ == "__main__":

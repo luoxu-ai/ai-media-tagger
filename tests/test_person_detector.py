@@ -3,7 +3,13 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from person_detector import PersonDetector, _letterbox, _presence_input
+from person_detector import (
+    PersonDetector,
+    _letterbox,
+    _presence_input,
+    clear_detection_cache_file,
+    detection_cache_file_info,
+)
 
 
 def test_letterbox_has_expected_input_shape():
@@ -18,6 +24,19 @@ def test_presence_input_has_expected_shape_and_dtype():
     array = _presence_input(image)
     assert array.shape == (1, 3, 224, 224)
     assert array.dtype == np.float32
+
+
+def test_detection_cache_can_be_inspected_and_cleared_without_loading_models(tmp_path, monkeypatch):
+    cache_path = tmp_path / "detection_cache.json"
+    cache_path.write_text(
+        '{"version":"test","entries":{"one":{},"two":{}}}', encoding="utf-8"
+    )
+    monkeypatch.setattr("person_detector.default_detection_cache_path", lambda: cache_path)
+    count, size = detection_cache_file_info()
+    assert count == 2
+    assert size > 0
+    clear_detection_cache_file()
+    assert not cache_path.exists()
 
 
 def test_presence_verifier_can_confirm_a_person_when_box_models_do_not():

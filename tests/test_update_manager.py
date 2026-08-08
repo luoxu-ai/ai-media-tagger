@@ -9,10 +9,12 @@ from update_manager import (
     UpdateCancelled,
     UpdateError,
     download_release,
+    consume_update_startup_result,
     is_installable_signature_status,
     is_newer_version,
     release_from_payload,
     record_successful_check,
+    record_update_install_started,
     should_check_automatically,
     version_tuple,
 )
@@ -39,23 +41,23 @@ def test_release_payload_prefers_the_official_installer_asset():
         {
             "tag_name": "v1.2.0",
             "body": "更新说明",
-            "html_url": "https://example.test/release",
+            "html_url": "https://github.com/luoxu-ai/ai-media-tagger/releases/tag/v1.2.0",
             "assets": [
                 {
                     "name": "other.exe",
-                    "browser_download_url": "https://example.test/other.exe",
+                    "browser_download_url": "https://github.com/luoxu-ai/ai-media-tagger/releases/download/v1.2.0/other.exe",
                     "digest": f"sha256:{'b' * 64}",
                     "size": 1,
                 },
                 {
                     "name": "AI媒体标签工具.exe",
-                    "browser_download_url": "https://example.test/app.exe",
+                    "browser_download_url": "https://github.com/luoxu-ai/ai-media-tagger/releases/download/v1.2.0/AI-Media-Tagger.exe",
                     "digest": f"sha256:{digest}",
                     "size": 203,
                 },
                 {
                     "name": "AI媒体标签工具安装程序.exe",
-                    "browser_download_url": "https://example.test/setup.exe",
+                    "browser_download_url": "https://github.com/luoxu-ai/ai-media-tagger/releases/download/v1.2.0/AI-Media-Tagger-Setup.exe",
                     "digest": f"sha256:{digest}",
                     "size": 204,
                 },
@@ -65,7 +67,7 @@ def test_release_payload_prefers_the_official_installer_asset():
     assert release.version == "1.2.0"
     assert release.sha256 == digest
     assert release.asset_name == "AI媒体标签工具安装程序.exe"
-    assert release.download_url.endswith("setup.exe")
+    assert release.download_url.casefold().endswith("setup.exe")
 
 
 def test_release_without_sha256_is_rejected():
@@ -76,7 +78,46 @@ def test_release_without_sha256_is_rejected():
                 "assets": [
                     {
                         "name": "AI媒体标签工具.exe",
-                        "browser_download_url": "https://example.test/app.exe",
+                        "browser_download_url": "https://github.com/luoxu-ai/ai-media-tagger/releases/download/v1.2.0/AI-Media-Tagger.exe",
+                    }
+                ],
+            }
+        )
+
+
+def test_release_rejects_unknown_executable_asset_name():
+    with pytest.raises(UpdateError):
+        release_from_payload(
+            {
+                "tag_name": "v9.9.9",
+                "assets": [
+                    {
+                        "name": "unexpected.exe",
+                        "browser_download_url": "https://github.com/example/release/unexpected.exe",
+                        "digest": f"sha256:{'a' * 64}",
+                    }
+                ],
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://github.com/luoxu-ai/ai-media-tagger/app.exe",
+        "https://example.test/AI-Media-Tagger-Setup.exe",
+    ],
+)
+def test_release_rejects_untrusted_download_url(url):
+    with pytest.raises(UpdateError, match="GitHub HTTPS"):
+        release_from_payload(
+            {
+                "tag_name": "v1.2.3",
+                "assets": [
+                    {
+                        "name": "AI-Media-Tagger-Setup.exe",
+                        "browser_download_url": url,
+                        "digest": f"sha256:{'a' * 64}",
                     }
                 ],
             }
@@ -174,3 +215,16 @@ def test_automatic_check_is_limited_to_once_per_day(tmp_path):
         record_successful_check(now=1000.0)
         assert not should_check_automatically(now=1001.0)
         assert should_check_automatically(now=1000.0 + 24 * 60 * 60)
+
+
+def test_update_completion_marker_is_reported_once(tmp_path):
+    with patch("update_manager.update_storage_directory", return_value=tmp_path):
+        record_update_install_started("1.3.0", "1.2.2")
+        assert consume_update_startup_result("1.3.0") == ("completed", "1.3.0")
+        assert consume_update_startup_result("1.3.0") is None
+
+
+def test_update_failure_keeps_current_version_available(tmp_path):
+    with patch("update_manager.update_storage_directory", return_value=tmp_path):
+        record_update_install_started("1.3.0", "1.2.2")
+        assert consume_update_startup_result("1.2.2") == ("failed", "1.2.2")

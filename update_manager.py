@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 import time
 from dataclasses import dataclass
@@ -24,9 +25,13 @@ RELEASE_ASSET_NAMES = (
     "AI-Media-Tagger.exe",
     "AI.exe",
 )
+TRUSTED_RELEASE_HOSTS = {
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+}
 USER_AGENT = "AI-Media-Tagger-Updater"
 AUTOMATIC_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
-LEGACY_UNSIGNED_UPDATE_ENV = "AI_TAG_ALLOW_UNSIGNED_UPDATE"
 
 
 class UpdateError(RuntimeError):
@@ -40,25 +45,6 @@ class UpdateCancelled(UpdateError):
 def is_installable_signature_status(status: str) -> bool:
     """Accept valid signatures and explicitly unsigned official builds only."""
     return status in {"Valid", "NotSigned"}
-
-
-def clear_legacy_unsigned_update_override() -> None:
-    """Remove the one-time compatibility flag used by v1.2.1 clients."""
-    os.environ.pop(LEGACY_UNSIGNED_UPDATE_ENV, None)
-    if os.name != "nt":
-        return
-    try:
-        import winreg
-
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            "Environment",
-            0,
-            winreg.KEY_SET_VALUE,
-        ) as key:
-            winreg.DeleteValue(key, LEGACY_UNSIGNED_UPDATE_ENV)
-    except (FileNotFoundError, OSError):
-        pass
 
 
 @dataclass(frozen=True)
@@ -123,16 +109,6 @@ def release_from_payload(payload: dict) -> ReleaseInfo:
         None,
     )
     if asset is None:
-        asset = next(
-            (
-                item
-                for item in assets
-                if isinstance(item, dict)
-                and str(item.get("name", "")).casefold().endswith(".exe")
-            ),
-            None,
-        )
-    if asset is None:
         raise UpdateError("最新版本没有找到 Windows EXE。")
     digest = _sha256_from_digest(asset.get("digest"))
     if not digest:
@@ -141,6 +117,12 @@ def release_from_payload(payload: dict) -> ReleaseInfo:
     url = str(asset.get("browser_download_url", "")).strip()
     if not version or not url:
         raise UpdateError("最新版本信息不完整。")
+    parsed_url = urllib.parse.urlparse(url)
+    if (
+        parsed_url.scheme.casefold() != "https"
+        or (parsed_url.hostname or "").casefold() not in TRUSTED_RELEASE_HOSTS
+    ):
+        raise UpdateError("更新文件不是来自可信的 GitHub HTTPS 地址，已停止更新。")
     return ReleaseInfo(
         version=version,
         notes=str(payload.get("body") or "本次版本包含功能优化和问题修复。"),
@@ -166,6 +148,56 @@ def fetch_latest_release(timeout: float = 10.0) -> ReleaseInfo:
 def update_storage_directory() -> Path:
     root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
     return root / "AI媒体标签工具" / "updates"
+
+
+def update_install_marker_path() -> Path:
+    return update_storage_directory() / "pending_install.json"
+
+
+def record_update_install_started(target_version: str, current_version: str) -> None:
+    directory = update_storage_directory()
+    directory.mkdir(parents=True, exist_ok=True)
+    marker = update_install_marker_path()
+    temporary = marker.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "target_version": target_version,
+                "previous_version": current_version,
+                "started_at": time.time(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    os.replace(temporary, marker)
+
+
+def clear_update_install_marker() -> None:
+    try:
+        update_install_marker_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def consume_update_startup_result(current_version: str) -> tuple[str, str] | None:
+    """Return a one-shot completed/failed status after an installer restart."""
+    marker = update_install_marker_path()
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        target = str(payload.get("target_version") or "").strip()
+        previous = str(payload.get("previous_version") or "").strip()
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, AttributeError):
+        clear_update_install_marker()
+        return None
+    clear_update_install_marker()
+    if not target:
+        return None
+    if not is_newer_version(target, current_version):
+        return "completed", current_version
+    return "failed", previous or current_version
 
 
 def should_check_automatically(now: float | None = None) -> bool:

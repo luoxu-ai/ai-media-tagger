@@ -4,6 +4,7 @@ import queue
 import os
 import hashlib
 import json
+import platform
 import shutil
 import statistics
 import sys
@@ -11,8 +12,8 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal, QSize, QUrl, QRect, QSettings
-from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent, QMouseEvent, QKeyEvent, QIcon, QPainter
+from PySide6.QtCore import Qt, QTimer, Signal, QSize, QUrl, QRect, QSettings, QEvent, QObject
+from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent, QMouseEvent, QKeyEvent, QIcon, QPainter, QKeySequence, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
@@ -31,18 +32,22 @@ from person_detector import (
     MODEL_VERSION,
     ModelUnavailableError,
     PersonDetector,
+    clear_detection_cache_file,
+    detection_cache_file_info,
 )
 from update_manager import (
     ReleaseInfo,
     UpdateCancelled,
     UpdateError,
     authenticode_status,
-    clear_legacy_unsigned_update_override,
     download_release,
     fetch_latest_release,
     is_installable_signature_status,
     is_newer_version,
     launch_installer,
+    clear_update_install_marker,
+    consume_update_startup_result,
+    record_update_install_started,
     record_successful_check,
     should_check_automatically,
 )
@@ -107,6 +112,65 @@ def effective_theme() -> str:
         except (AttributeError, RuntimeError):
             pass
     return "light"
+
+
+def _set_windows_immersive_dark_mode(hwnd: int, dark: bool) -> bool:
+    """Apply the Windows non-client title-bar theme to one native window."""
+    import ctypes
+
+    setter = ctypes.windll.dwmapi.DwmSetWindowAttribute
+    setter.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.c_uint,
+    )
+    setter.restype = ctypes.c_long
+    enabled = ctypes.c_int(1 if dark else 0)
+    for attribute in (20, 19):  # Windows 10 20H1+, then the older fallback.
+        result = setter(
+            ctypes.c_void_p(hwnd),
+            attribute,
+            ctypes.byref(enabled),
+            ctypes.sizeof(enabled),
+        )
+        if result == 0:
+            return True
+    return False
+
+
+def apply_windows_title_bar_theme(window: QWidget, dark: bool | None = None) -> bool:
+    """Keep native Windows title bars aligned with the app-selected theme."""
+    if os.name != "nt":
+        return False
+    try:
+        return _set_windows_immersive_dark_mode(
+            int(window.winId()),
+            effective_theme() == "dark" if dark is None else dark,
+        )
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+class WindowsTitleBarThemeFilter(QObject):
+    """Theme every top-level window, including transient message boxes."""
+
+    def eventFilter(self, watched, event):
+        if (
+            isinstance(watched, QWidget)
+            and watched.isWindow()
+            and event.type() in {QEvent.Type.Show, QEvent.Type.WinIdChange}
+        ):
+            apply_windows_title_bar_theme(watched)
+        return super().eventFilter(watched, event)
+
+
+def install_windows_title_bar_theme_filter(app: QApplication) -> None:
+    if getattr(app, "_windows_title_bar_theme_filter", None) is not None:
+        return
+    theme_filter = WindowsTitleBarThemeFilter(app)
+    app.installEventFilter(theme_filter)
+    app._windows_title_bar_theme_filter = theme_filter
 
 
 def legacy_log_directory() -> Path:
@@ -635,6 +699,7 @@ QPushButton {
 QPushButton:hover { background-color: #e4e9f0; }
 QPushButton:pressed { background-color: #d9e0e9; }
 QPushButton:disabled { background-color: #edf0f4; color: #a2acb9; }
+QPushButton:focus { border: 2px solid #1677ff; }
 
 QPushButton#outlineAction {
     background-color: #ffffff;
@@ -799,6 +864,8 @@ def apply_application_theme() -> None:
     dark = effective_theme() == "dark"
     app.setProperty("darkTheme", dark)
     app.setStyleSheet(STYLE + (DARK_STYLE if dark else ""))
+    for window in app.topLevelWidgets():
+        apply_windows_title_bar_theme(window, dark)
 
 
 class CheckableListWidget(QListWidget):
@@ -966,6 +1033,7 @@ class SettingsDialog(QDialog):
     def __init__(
         self, on_check, on_show_log, on_export_log,
         parent: QWidget | None = None,
+        on_cache_info=None, on_clear_cache=None, on_diagnostics=None,
     ):
         super().__init__(parent)
         self.setWindowTitle("设置")
@@ -1034,6 +1102,28 @@ class SettingsDialog(QDialog):
         log_buttons.addWidget(export_log)
         log_buttons.addStretch()
         layout.addLayout(log_buttons)
+        maintenance_heading = QLabel("存储与诊断")
+        maintenance_heading.setObjectName("sectionLabel")
+        layout.addWidget(maintenance_heading)
+        maintenance_row = QHBoxLayout()
+        self.cache_status = QLabel(on_cache_info() if on_cache_info else "检测缓存：暂无")
+        self.cache_status.setObjectName("muted")
+        maintenance_row.addWidget(self.cache_status, 1)
+        clear_cache = QPushButton("清除缓存")
+        clear_cache.setObjectName("outlineAction")
+        clear_cache.setEnabled(on_clear_cache is not None)
+        if on_clear_cache is not None:
+            clear_cache.clicked.connect(
+                lambda: self.cache_status.setText(on_clear_cache())
+            )
+        maintenance_row.addWidget(clear_cache)
+        diagnostics = QPushButton("系统诊断")
+        diagnostics.setObjectName("outlineAction")
+        diagnostics.setEnabled(on_diagnostics is not None)
+        if on_diagnostics is not None:
+            diagnostics.clicked.connect(on_diagnostics)
+        maintenance_row.addWidget(diagnostics)
+        layout.addLayout(maintenance_row)
         layout.addSpacing(2)
 
         buttons = QHBoxLayout()
@@ -1047,7 +1137,7 @@ class SettingsDialog(QDialog):
 
 
 class AboutDialog(QDialog):
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(self, parent: QWidget | None = None, on_diagnostics=None):
         super().__init__(parent)
         self.setWindowTitle("关于我们")
         self.setModal(True)
@@ -1094,6 +1184,12 @@ class AboutDialog(QDialog):
             lambda: QDesktopServices.openUrl(QUrl(GITHUB_PROJECT_URL))
         )
         buttons.addWidget(project)
+        diagnostics = QPushButton("系统诊断")
+        diagnostics.setObjectName("outlineAction")
+        diagnostics.setEnabled(on_diagnostics is not None)
+        if on_diagnostics is not None:
+            diagnostics.clicked.connect(on_diagnostics)
+        buttons.addWidget(diagnostics)
         buttons.addStretch()
         close_button = QPushButton("关闭")
         close_button.setObjectName("primary")
@@ -1216,7 +1312,9 @@ class UpdateDialog(QDialog):
         self.downloading = False
         self.update_progress.setRange(0, 1000)
         self.update_progress.setValue(0)
-        self.update_status.setText(message)
+        self.update_status.setText(
+            f"{message}\n当前版本未受影响，可以关闭窗口继续使用，或重试下载。"
+        )
         self.install_button.setEnabled(True)
         self.install_button.setText("重试下载")
         self.later_button.setEnabled(True)
@@ -1255,6 +1353,7 @@ class MainWindow(QMainWindow):
         self.active_files: list[Path] = []
         self.log_lines: list[str] = []
         self.current_log_path: Path | None = None
+        self._persisted_log_line_count = 0
         self.task_started_at = 0.0
         self._recent_item_seconds: list[float] = []
         self.processing_current = 0
@@ -1269,6 +1368,7 @@ class MainWindow(QMainWindow):
         self.environment_issues: list[str] = []
         self._restoring_session = False
         self._build_ui()
+        self._install_keyboard_shortcuts()
         self._session_save_timer = QTimer(self)
         self._session_save_timer.setSingleShot(True)
         self._session_save_timer.timeout.connect(self._persist_session_state)
@@ -1281,6 +1381,11 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(2500, self._start_update_check)
         if getattr(sys, "frozen", False):
             QTimer.singleShot(900, self._start_environment_check)
+        self._startup_update_result = None
+        if getattr(sys, "frozen", False):
+            self._startup_update_result = consume_update_startup_result(APP_VERSION)
+            if self._startup_update_result is not None:
+                QTimer.singleShot(1400, self._show_startup_update_result)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1289,6 +1394,38 @@ class MainWindow(QMainWindow):
         # native window exists prevents Windows from intermittently retaining
         # the launcher's blank taskbar icon.
         QTimer.singleShot(0, self._apply_windows_taskbar_icon)
+
+    def _install_keyboard_shortcuts(self) -> None:
+        self._shortcuts: list[QShortcut] = []
+        for sequence, callback in (
+            (QKeySequence.StandardKey.Open, self.choose_files),
+            (QKeySequence("Ctrl+Shift+O"), self.choose_folder),
+            (QKeySequence.StandardKey.SelectAll, self.check_all),
+        ):
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.activated.connect(callback)
+            self._shortcuts.append(shortcut)
+        self.choose_file_button.setToolTip("选择文件（Ctrl+O）")
+        self.choose_folder_button.setToolTip("选择文件夹（Ctrl+Shift+O）")
+        self.select_all_button.setToolTip("全选（Ctrl+A）")
+
+    def _show_startup_update_result(self) -> None:
+        result = self._startup_update_result
+        self._startup_update_result = None
+        if result is None:
+            return
+        status, version = result
+        if status == "completed":
+            QMessageBox.information(
+                self, "更新完成", f"软件已成功更新至 v{version}。"
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "更新未完成",
+                f"新版安装没有完成，当前仍可继续使用 v{version}。\n"
+                "你可以稍后重新检查更新。",
+            )
 
     def _apply_windows_taskbar_icon(self) -> None:
         if os.name != "nt" or self._icon_path is None:
@@ -1469,7 +1606,7 @@ class MainWindow(QMainWindow):
             )
             option.setCheckable(True)
             option.setChecked(value == self.status_filter)
-            option.setFixedWidth(62 if value != "exported" else 72)
+            option.setMinimumWidth(72 if value != "exported" else 86)
             option.setVisible(False)
             option.clicked.connect(
                 lambda checked=False, selected=value: self._set_status_filter(selected)
@@ -1637,11 +1774,95 @@ class MainWindow(QMainWindow):
                 dialog.accept()
             self.export_log()
 
-        dialog = SettingsDialog(check_now, show_logs, export_logs, self)
+        dialog = SettingsDialog(
+            check_now,
+            show_logs,
+            export_logs,
+            self,
+            on_cache_info=self.detection_cache_summary,
+            on_clear_cache=self.clear_detection_cache,
+            on_diagnostics=self.show_system_diagnostics,
+        )
         dialog.exec()
 
     def show_about_dialog(self) -> None:
-        AboutDialog(self).exec()
+        AboutDialog(self, on_diagnostics=self.show_system_diagnostics).exec()
+
+    def detection_cache_summary(self) -> str:
+        with self._detector_lock:
+            if self._detector is not None:
+                count, size = self._detector.cache_info()
+            else:
+                count, size = detection_cache_file_info()
+        return f"检测缓存：{count} 条，{size / 1024 / 1024:.1f} MB"
+
+    def clear_detection_cache(self) -> str:
+        if self.running or self.importing:
+            QMessageBox.information(
+                self, APP_NAME, "请等待当前导入或处理任务完成后再清除检测缓存。"
+            )
+            return self.detection_cache_summary()
+        answer = QMessageBox.question(
+            self,
+            "清除检测缓存",
+            "清除后，之前处理过的图片再次导入时需要重新识别。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return self.detection_cache_summary()
+        try:
+            with self._detector_lock:
+                if self._detector is not None:
+                    self._detector.clear_cache()
+                else:
+                    clear_detection_cache_file()
+        except OSError as exc:
+            QMessageBox.warning(self, APP_NAME, f"无法清除检测缓存：{exc}")
+            return self.detection_cache_summary()
+        return "检测缓存：已清除"
+
+    def system_diagnostics_text(self) -> str:
+        count, size = detection_cache_file_info()
+        issues = runtime_environment_issues()
+        return "\n".join(
+            [
+                f"软件版本：v{APP_VERSION}",
+                f"系统：{platform.system()} {platform.release()} ({platform.machine()})",
+                f"模型版本：{MODEL_VERSION}",
+                f"模型运行方式：{MODEL_RUNTIME}",
+                f"检测缓存：{count} 条，{size / 1024 / 1024:.1f} MB",
+                f"ExifTool：{'异常' if any('ExifTool' in item for item in issues) else '正常'}",
+                f"识别模型：{'异常' if any('模型' in item for item in issues) else '正常'}",
+                f"日志写入：{'异常' if any('日志目录' in item for item in issues) else '正常'}",
+                "隐私说明：诊断信息不包含图片、文件名或本机路径。",
+                *( ["", "发现的问题：", *[f"- {item}" for item in issues]] if issues else [] ),
+            ]
+        )
+
+    def show_system_diagnostics(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("系统诊断")
+        dialog.resize(600, 420)
+        layout = QVBoxLayout(dialog)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(self.system_diagnostics_text())
+        layout.addWidget(text, 1)
+        buttons = QHBoxLayout()
+        copy_button = QPushButton("复制诊断信息")
+        copy_button.setObjectName("outlineAction")
+        copy_button.clicked.connect(
+            lambda: QApplication.clipboard().setText(text.toPlainText())
+        )
+        buttons.addWidget(copy_button)
+        buttons.addStretch()
+        close_button = QPushButton("关闭")
+        close_button.setObjectName("primary")
+        close_button.clicked.connect(dialog.accept)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+        dialog.exec()
 
     def show_update_dialog(self) -> None:
         release = self.available_release
@@ -1751,9 +1972,17 @@ class MainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def _install_downloaded_update(self, downloaded: Path) -> None:
+        marker_created = False
         try:
+            if self.available_release is not None:
+                record_update_install_started(
+                    self.available_release.version, APP_VERSION
+                )
+                marker_created = True
             launch_installer(downloaded)
-        except UpdateError as exc:
+        except (OSError, UpdateError) as exc:
+            if marker_created:
+                clear_update_install_marker()
             self._update_download_in_progress = False
             if self._update_dialog is not None:
                 self._update_dialog.set_error(str(exc))
@@ -1867,6 +2096,26 @@ class MainWindow(QMainWindow):
         self.status_filter = value if value in {"all", "exported", "skipped", "failure"} else "all"
         self._apply_status_filter()
 
+    def _update_status_filter_labels(self) -> None:
+        counts = {"exported": 0, "skipped": 0, "failure": 0}
+        for status in self.file_statuses.values():
+            text, kind = status
+            if text in {"已导出", "已有标签"}:
+                counts["exported"] += 1
+            if text == "未检测到人物":
+                counts["skipped"] += 1
+            if kind == "failure":
+                counts["failure"] += 1
+        labels = {
+            "all": f"全部 {len(self.files)}",
+            "exported": f"已导出 {counts['exported']}",
+            "skipped": f"未检测 {counts['skipped']}",
+            "failure": f"失败 {counts['failure']}",
+        }
+        for key, button in self.status_filter_buttons.items():
+            button.setText(labels[key])
+            button.setMinimumWidth(72 if key != "exported" else 86)
+
     def _status_matches_filter(self, status: tuple[str, str] | None) -> bool:
         if self.status_filter == "all":
             return True
@@ -1923,6 +2172,7 @@ class MainWindow(QMainWindow):
         self.list_stack.setCurrentIndex(1 if self.files else 0)
         for button in self.status_filter_buttons.values():
             button.setVisible(bool(self.files))
+        self._update_status_filter_labels()
         self._apply_status_filter()
         self.update_checked_count()
         self.status.setText("文件已就绪" if self.files else "等待添加文件")
@@ -1931,6 +2181,7 @@ class MainWindow(QMainWindow):
     def _set_file_status(self, path: Path, text: str, kind: str) -> None:
         key = str(path).casefold()
         self.file_statuses[key] = (text, kind)
+        self._update_status_filter_labels()
         item = self._list_items_by_key.get(key)
         if item is not None:
             item.setData(FILE_STATUS_TEXT_ROLE, text)
@@ -2524,6 +2775,7 @@ class MainWindow(QMainWindow):
                 candidate = folder / f"AI媒体标签导出报告_{stamp}_{index}.txt"
                 index += 1
             self.current_log_path = candidate
+            self._persisted_log_line_count = 0
             self._persist_log()
         except OSError:
             self.current_log_path = None
@@ -2533,7 +2785,22 @@ class MainWindow(QMainWindow):
             return
         try:
             self.current_log_path.parent.mkdir(parents=True, exist_ok=True)
-            self.current_log_path.write_text("\n".join(self.log_lines), encoding="utf-8-sig")
+            if (
+                not self.current_log_path.exists()
+                or self._persisted_log_line_count > len(self.log_lines)
+            ):
+                self.current_log_path.write_text(
+                    "\n".join(self.log_lines), encoding="utf-8-sig"
+                )
+                self._persisted_log_line_count = len(self.log_lines)
+                return
+            pending = self.log_lines[self._persisted_log_line_count :]
+            if not pending:
+                return
+            prefix = "\n" if self.current_log_path.stat().st_size > 3 else ""
+            with self.current_log_path.open("a", encoding="utf-8") as output:
+                output.write(prefix + "\n".join(pending))
+            self._persisted_log_line_count = len(self.log_lines)
         except OSError:
             pass
 
@@ -2543,6 +2810,7 @@ class MainWindow(QMainWindow):
             latest = persistent_log_files()[0]
             self.current_log_path = latest
             self.log_lines = latest.read_text(encoding="utf-8-sig").splitlines()
+            self._persisted_log_line_count = len(self.log_lines)
         except (IndexError, OSError):
             pass
 
@@ -2972,10 +3240,9 @@ def main():
         except Exception as exc:
             Path(self_test_result).write_text(f"success=False\nmessage={exc}", encoding="utf-8")
         return
-    if getattr(sys, "frozen", False):
-        clear_legacy_unsigned_update_override()
     configure_windows_app_identity()
     app = QApplication(sys.argv)
+    install_windows_title_bar_theme_filter(app)
     icon_path = bundled_path("assets/app-icon.ico")
     if not icon_path.is_file():
         icon_path = bundled_path("assets/app-icon.png")
