@@ -19,8 +19,8 @@ LATEST_RELEASE_API = (
     f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
 )
 RELEASE_ASSET_NAMES = (
-    "AI媒体标签工具安装程序.exe",
     "AI-Media-Tagger-Setup.exe",
+    "AI媒体标签工具安装程序.exe",
     "AI媒体标签工具.exe",
     "AI-Media-Tagger.exe",
     "AI.exe",
@@ -267,10 +267,12 @@ def download_release(
 def authenticode_status(path: Path) -> str:
     if os.name != "nt":
         return "Unsupported"
+    environment = os.environ.copy()
+    environment["AI_MEDIA_TAGGER_SIGNATURE_PATH"] = str(path)
     command = (
-        "$signature = Get-AuthenticodeSignature -LiteralPath $args[0]; "
         "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
-        "Write-Output $signature.Status"
+        "(Get-AuthenticodeSignature -LiteralPath "
+        "$env:AI_MEDIA_TAGGER_SIGNATURE_PATH).Status"
     )
     try:
         result = subprocess.run(
@@ -280,8 +282,8 @@ def authenticode_status(path: Path) -> str:
                 "-NonInteractive",
                 "-Command",
                 command,
-                str(path),
             ],
+            env=environment,
             capture_output=True,
             text=True,
             encoding="utf-8",

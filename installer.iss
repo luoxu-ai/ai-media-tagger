@@ -1,5 +1,5 @@
 #define MyAppName "AI媒体标签工具"
-#define MyAppVersion "1.2.3"
+#define MyAppVersion "1.2.4"
 #define MyAppPublisher "深圳市艾润特贸易有限公司"
 #define MyAppExeName "AI媒体标签工具.exe"
 

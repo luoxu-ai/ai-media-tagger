@@ -9,6 +9,7 @@ build/
 dist/
 dist_installer/
 vendor/
+repair_payload/
 _exiftool/
 exiftool.zip
 *.spec.bak
