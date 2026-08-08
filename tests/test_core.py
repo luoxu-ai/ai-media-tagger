@@ -187,7 +187,7 @@ class ServiceTests(unittest.TestCase):
     def test_streams_utf8_arguments_without_temp_argfile(self, run):
         run.return_value = type("Result", (), {"returncode": 0, "stdout": "[]", "stderr": ""})()
 
-        chinese_path = Path(r"C:\Users\测试用户\Desktop\导出目录\商品图.jpg")
+        chinese_path = Path(r"C:\Users\CBT-美工\Desktop\导出目录\商品图.jpg")
         ExifToolService(Path("exiftool.exe"))._read_subject(chinese_path)
 
         command = run.call_args.args[0]

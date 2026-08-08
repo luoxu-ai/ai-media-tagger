@@ -3,41 +3,192 @@ from __future__ import annotations
 import queue
 import os
 import hashlib
+import json
+import shutil
 import statistics
 import sys
 import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal, QSize, QUrl, QRect
+from PySide6.QtCore import Qt, QTimer, Signal, QSize, QUrl, QRect, QSettings
 from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent, QMouseEvent, QKeyEvent, QIcon, QPainter
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
     QListWidget, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QTextEdit, QVBoxLayout, QWidget, QListWidgetItem, QStyle, QStyleOptionViewItem,
-    QStackedLayout, QStyledItemDelegate,
+    QTextEdit, QVBoxLayout, QWidget, QListWidgetItem, QStyle, QStyleOptionViewItem, QLayout,
+    QStackedLayout, QStyledItemDelegate, QDialog, QButtonGroup,
 )
 
 from core import APP_NAME, APP_VERSION, TAG_VALUE, ExifToolService, TagResult, bundled_path, collect_media, copy_without_overwrite, export_tagged_copies_batch, export_tagged_copy, find_exiftool, remove_source_after_verified_export, rename_tagged_file
 from cleanup_app import AI_SUFFIX, restore_filename
-from person_detector import DetectionResult, ModelUnavailableError, PersonDetector
+from person_detector import (
+    DetectionResult,
+    MODEL_RELEASE_DATE,
+    MODEL_RELATIVE_PATHS,
+    MODEL_RUNTIME,
+    MODEL_VERSION,
+    ModelUnavailableError,
+    PersonDetector,
+)
+from update_manager import (
+    ReleaseInfo,
+    UpdateCancelled,
+    UpdateError,
+    authenticode_status,
+    clear_legacy_unsigned_update_override,
+    download_release,
+    fetch_latest_release,
+    is_installable_signature_status,
+    is_newer_version,
+    launch_installer,
+    record_successful_check,
+    should_check_automatically,
+)
 
 
-CONTACT_URL = "https://github.com/luoxu-ai/ai-media-tagger/issues/new"
+FEISHU_CONTACT_URL = (
+    "https://www.feishu.cn/invitation/page/add_contact/"
+    "?token=ecao2a09-025f-48ea-a005-245a4c86d7a6"
+)
 
 FILE_STATUS_TEXT_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 FILE_STATUS_KIND_ROLE = int(Qt.ItemDataRole.UserRole) + 2
 WINDOWS_APP_USER_MODEL_ID = "CBT.AIMediaTagTool"
+DEVELOPER_NAME = "Xu Luo"
+COMPANY_NAME = "深圳市艾润特贸易有限公司"
+GITHUB_PROJECT_URL = "https://github.com/luoxu-ai/ai-media-tagger"
+SETTINGS_ORGANIZATION = "CBT"
+SETTINGS_APPLICATION = "AIMediaTagTool"
 
 
-def persistent_log_directory() -> Path:
+def automatic_update_checks_enabled() -> bool:
+    value = QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION).value(
+        "updates/automatic", True
+    )
+    if isinstance(value, str):
+        return value.casefold() not in {"false", "0", "no"}
+    return bool(value)
+
+
+def set_automatic_update_checks_enabled(enabled: bool) -> None:
+    QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION).setValue(
+        "updates/automatic", enabled
+    )
+
+
+def selected_theme() -> str:
+    value = str(
+        QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION).value(
+            "appearance/theme", "system"
+        )
+    ).casefold()
+    return value if value in {"system", "light", "dark"} else "system"
+
+
+def set_selected_theme(theme: str) -> None:
+    if theme not in {"system", "light", "dark"}:
+        theme = "system"
+    QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION).setValue(
+        "appearance/theme", theme
+    )
+
+
+def effective_theme() -> str:
+    theme = selected_theme()
+    if theme != "system":
+        return theme
+    app = QApplication.instance()
+    if app is not None:
+        try:
+            if app.styleHints().colorScheme() == Qt.ColorScheme.Dark:
+                return "dark"
+        except (AttributeError, RuntimeError):
+            pass
+    return "light"
+
+
+def legacy_log_directory() -> Path:
     root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
     return root / "AI媒体标签工具" / "logs"
 
 
+def persistent_log_directory() -> Path:
+    """Keep installed-build logs beside the application, not in a temp folder."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "logs"
+    return legacy_log_directory()
+
+
+def persistent_session_path() -> Path | None:
+    """Keep the last task outside temporary extraction and update folders."""
+    if os.environ.get("QT_QPA_PLATFORM", "").casefold() == "offscreen":
+        return None
+    return legacy_log_directory().parent / "last_task.json"
+
+
+def runtime_environment_issues() -> list[str]:
+    """Run inexpensive startup checks without loading the large ONNX models."""
+    issues: list[str] = []
+    for relative in MODEL_RELATIVE_PATHS:
+        model = bundled_path(relative)
+        try:
+            if not model.is_file() or model.stat().st_size <= 0:
+                issues.append(f"人物识别模型缺失或损坏：{Path(relative).name}")
+        except OSError:
+            issues.append(f"无法读取人物识别模型：{Path(relative).name}")
+    try:
+        executable = find_exiftool()
+        if executable.stat().st_size <= 0:
+            issues.append("ExifTool 文件为空，请重新安装软件。")
+    except (FileNotFoundError, OSError) as exc:
+        issues.append(str(exc))
+
+    log_folder = persistent_log_directory()
+    probe = log_folder / f".write_test_{os.getpid()}"
+    try:
+        log_folder.mkdir(parents=True, exist_ok=True)
+        probe.write_text("ok", encoding="ascii")
+        probe.unlink(missing_ok=True)
+        if shutil.disk_usage(log_folder).free < 512 * 1024 * 1024:
+            issues.append("软件所在磁盘剩余空间不足 512 MB。")
+    except OSError:
+        issues.append("日志目录不可写，请检查安装目录权限。")
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return issues
+
+
+_LOG_MIGRATION_ATTEMPTED = False
+
+
+def migrate_legacy_logs() -> None:
+    """Copy old LocalAppData reports into the installed logs folder once."""
+    global _LOG_MIGRATION_ATTEMPTED
+    if _LOG_MIGRATION_ATTEMPTED or not getattr(sys, "frozen", False):
+        return
+    _LOG_MIGRATION_ATTEMPTED = True
+    source = legacy_log_directory()
+    destination = persistent_log_directory()
+    try:
+        if source.resolve() == destination.resolve() or not source.exists():
+            return
+        destination.mkdir(parents=True, exist_ok=True)
+        for old_log in source.glob("AI媒体标签导出报告_*.txt"):
+            target = destination / old_log.name
+            if not target.exists():
+                shutil.copy2(old_log, target)
+    except OSError:
+        # Logging must never prevent the application from starting.
+        pass
+
+
 def persistent_log_files() -> list[Path]:
     """Return every saved task report, newest first."""
+    migrate_legacy_logs()
     try:
         return sorted(
             persistent_log_directory().glob("AI媒体标签导出报告_*.txt"),
@@ -174,6 +325,45 @@ QLabel#title {
     font-weight: 700;
     color: #1d1d1f;
     letter-spacing: -0.5px;
+}
+
+QPushButton#updateBadge {
+    background-color: #ff3b30;
+    color: #ffffff;
+    border: none;
+    border-radius: 11px;
+    padding: 2px 9px;
+    font-size: 12px;
+    font-weight: 800;
+}
+
+QPushButton#updateBadge:hover {
+    background-color: #e83228;
+}
+
+QPushButton#themeOption {
+    min-height: 34px;
+    min-width: 62px;
+    padding: 0 14px;
+    background-color: #ffffff;
+    color: #0867df;
+    border: 1px solid #9dc8ff;
+    border-radius: 0;
+    font-weight: 600;
+}
+QPushButton#themeOption[segment="first"] {
+    border-top-left-radius: 7px;
+    border-bottom-left-radius: 7px;
+}
+QPushButton#themeOption[segment="last"] {
+    border-top-right-radius: 7px;
+    border-bottom-right-radius: 7px;
+}
+QPushButton#themeOption:hover { background-color: #eef6ff; }
+QPushButton#themeOption:checked {
+    background-color: #1677ff;
+    color: #ffffff;
+    border-color: #1677ff;
 }
 
 QLabel#subtitle {
@@ -521,6 +711,95 @@ QProgressBar {
 QProgressBar::chunk { background-color: #1677ff; border-radius: 4px; }
 """
 
+DARK_STYLE = """
+QMainWindow, QWidget, QDialog {
+    background-color: #101722;
+    color: #e7edf6;
+}
+QLabel, QCheckBox { color: #e7edf6; background: transparent; }
+QLabel#title, QLabel#sectionLabel, QLabel#count, QLabel#dropTitle {
+    color: #f3f7fc;
+}
+QLabel#muted, QLabel#status, QLabel#subtitle { color: #9aa9bd; }
+QFrame#card, QFrame#filesPanel, QFrame#actionPanel {
+    background-color: #182231;
+    border-color: #2b394b;
+}
+QFrame#dropZone {
+    background-color: #141e2c;
+    border-color: #52627a;
+}
+QFrame#dropZone:hover { background-color: #172a43; border-color: #4b9cff; }
+QLabel#tag { background-color: #17345a; color: #71b1ff; }
+QWidget#fileHeader {
+    background-color: #202c3c;
+    border-bottom-color: #304055;
+}
+QWidget#listHost, QWidget#emptyState, QListWidget#fileList {
+    background-color: #182231;
+}
+QListWidget#fileList::item {
+    color: #d6deea;
+    background-color: #202c3c;
+}
+QListWidget#fileList::item:hover { background-color: #28374a; }
+QListWidget#fileList::item:selected { background-color: #173b67; color: #75b6ff; }
+QPushButton { background-color: #263447; color: #e5edf7; }
+QPushButton:hover { background-color: #304158; }
+QPushButton:pressed { background-color: #354a64; }
+QPushButton:disabled { background-color: #202a38; color: #69778b; }
+QPushButton#outlineAction {
+    background-color: #182231;
+    color: #75b6ff;
+    border-color: #365f91;
+}
+QPushButton#outlineAction:hover { background-color: #17345a; border-color: #4b91df; }
+QPushButton#smallAction { background-color: #202c3c; color: #75b6ff; }
+QPushButton#smallAction:hover { background-color: #173b67; color: #9bc9ff; }
+QPushButton#themeOption {
+    background-color: #182231;
+    color: #75b6ff;
+    border-color: #365f91;
+}
+QPushButton#themeOption:hover { background-color: #17345a; }
+QPushButton#themeOption:checked {
+    background-color: #2f8cff;
+    color: #ffffff;
+    border-color: #2f8cff;
+}
+QPushButton#secondaryAction { background-color: #173b67; color: #8fc4ff; }
+QPushButton#secondaryAction:hover { background-color: #1c4a80; color: #b4d9ff; }
+QPushButton#stopAction { background-color: #4a2528; color: #ff9f98; border-color: #6b3438; }
+QPushButton#stopAction:hover { background-color: #5a2b30; border-color: #8b4148; }
+QPushButton#stopAction:disabled { background-color: #202a38; color: #69778b; border: none; }
+QProgressBar { background-color: #2a3749; color: #a8b6c8; }
+QProgressBar::chunk { background-color: #2f8cff; }
+QTextEdit, QComboBox {
+    background-color: #111a27;
+    color: #e7edf6;
+    border: 1px solid #33445a;
+    border-radius: 8px;
+    padding: 6px;
+    selection-background-color: #1f5f9f;
+}
+QComboBox QAbstractItemView {
+    background-color: #182231;
+    color: #e7edf6;
+    selection-background-color: #1f5f9f;
+}
+QScrollBar::handle:vertical { background-color: #52627a; }
+QToolTip { background-color: #202c3c; color: #f3f7fc; border: 1px solid #52627a; }
+"""
+
+
+def apply_application_theme() -> None:
+    app = QApplication.instance()
+    if app is None:
+        return
+    dark = effective_theme() == "dark"
+    app.setProperty("darkTheme", dark)
+    app.setStyleSheet(STYLE + (DARK_STYLE if dark else ""))
+
 
 class CheckableListWidget(QListWidget):
     """A checkable list where clicking anywhere on a row toggles the item."""
@@ -565,27 +844,116 @@ class FileStatusDelegate(QStyledItemDelegate):
         "skipped": ("#9a6700", "#fff6d8"),
         "failure": ("#c9362b", "#fff1f0"),
     }
+    DARK_COLORS = {
+        "pending": ("#b0bdd0", "#2a3749"),
+        "processing": ("#8fc4ff", "#173b67"),
+        "success": ("#7bd99a", "#183d2a"),
+        "skipped": ("#ffd073", "#49391a"),
+        "failure": ("#ff9f98", "#4a2528"),
+    }
 
-    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
-        super().paint(painter, option, index)
-        status = index.data(FILE_STATUS_TEXT_ROLE)
-        if not status:
-            return
-        kind = index.data(FILE_STATUS_KIND_ROLE) or "pending"
-        foreground, background = self.COLORS.get(kind, self.COLORS["pending"])
-        painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        font = painter.font()
-        font.setBold(True)
-        font.setPointSizeF(max(9.0, font.pointSizeF() - 0.5))
-        painter.setFont(font)
-        width = max(76, min(148, painter.fontMetrics().horizontalAdvance(str(status)) + 24))
-        badge = QRect(
+    @staticmethod
+    def _badge_rect(option: QStyleOptionViewItem, width: int) -> QRect:
+        return QRect(
             option.rect.right() - width - 14,
             option.rect.center().y() - 13,
             width,
             26,
         )
+
+    def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:
+        """Reserve enough height for two text lines at every DPI/font scale."""
+        base = super().sizeHint(option, index)
+        metrics = option.fontMetrics
+        two_lines = metrics.lineSpacing() * 2 + 24
+        return QSize(base.width(), max(64, base.height(), two_lines))
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
+        status = index.data(FILE_STATUS_TEXT_ROLE)
+        if not status:
+            super().paint(painter, option, index)
+            return
+        kind = index.data(FILE_STATUS_KIND_ROLE) or "pending"
+        app = QApplication.instance()
+        dark = app is not None and bool(app.property("darkTheme"))
+        palette = (
+            self.DARK_COLORS
+            if dark
+            else self.COLORS
+        )
+        foreground, background = palette.get(kind, palette["pending"])
+
+        # Ask Qt to draw the complete row background and checkbox, but draw
+        # both text lines ourselves so a fixed status column is always free.
+        content_option = QStyleOptionViewItem(option)
+        self.initStyleOption(content_option, index)
+        full_text = content_option.text
+        content_option.text = ""
+        style = content_option.widget.style() if content_option.widget else QApplication.style()
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        style.drawControl(
+            QStyle.ControlElement.CE_ItemViewItem,
+            content_option,
+            painter,
+            content_option.widget,
+        )
+
+        badge_font = content_option.font
+        badge_font.setBold(True)
+        badge_font.setPointSizeF(max(9.0, badge_font.pointSizeF() - 0.5))
+        painter.setFont(badge_font)
+        width = max(
+            76,
+            min(148, painter.fontMetrics().horizontalAdvance(str(status)) + 24),
+        )
+        badge = self._badge_rect(option, width)
+
+        text_rect = style.subElementRect(
+            QStyle.SubElement.SE_ItemViewItemText,
+            content_option,
+            content_option.widget,
+        )
+        text_rect.setRight(badge.left() - 12)
+        if text_rect.width() > 20:
+            painter.setFont(content_option.font)
+            metrics = painter.fontMetrics()
+            name, _, parent = full_text.partition("\n")
+            line_height = metrics.height()
+            combined_height = line_height * 2 + 4
+            # QSS item padding can make SE_ItemViewItemText shorter than the
+            # two custom-painted lines, especially at 125%/150% Windows DPI.
+            # Centre against the full row and keep an explicit safe margin so
+            # glyph ascenders and descenders are never clipped.
+            safe_rect = option.rect.adjusted(0, 7, 0, -7)
+            top = safe_rect.center().y() - combined_height // 2
+            name_rect = QRect(text_rect.left(), top, text_rect.width(), line_height)
+            parent_rect = QRect(
+                text_rect.left(), top + line_height + 4, text_rect.width(), line_height
+            )
+            selected = bool(
+                content_option.state & QStyle.StateFlag.State_Selected
+            )
+            if dark:
+                name_color = "#75b6ff" if selected else "#d6deea"
+                parent_color = "#75b6ff" if selected else "#aebbd0"
+            else:
+                name_color = "#0867df" if selected else "#253247"
+                parent_color = "#0867df" if selected else "#5f6f86"
+            painter.setPen(QColor(name_color))
+            painter.drawText(
+                name_rect,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                metrics.elidedText(name, Qt.TextElideMode.ElideMiddle, name_rect.width()),
+            )
+            painter.setPen(QColor(parent_color))
+            painter.drawText(
+                parent_rect,
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                metrics.elidedText(parent, Qt.TextElideMode.ElideMiddle, parent_rect.width()),
+            )
+
+        painter.setFont(badge_font)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(background))
         painter.drawRoundedRect(badge, 9, 9)
@@ -594,10 +962,271 @@ class FileStatusDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class SettingsDialog(QDialog):
+    def __init__(
+        self, on_check, on_show_log, on_export_log,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("设置")
+        self.setModal(True)
+        self.setFixedWidth(460)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 16, 22, 16)
+        layout.setSpacing(12)
+
+        appearance = QLabel("外观")
+        appearance.setObjectName("sectionLabel")
+        layout.addWidget(appearance)
+        theme_row = QHBoxLayout()
+        theme_row.setSpacing(10)
+        theme_row.addWidget(QLabel("主题模式"))
+        theme_row.addStretch()
+        theme_options = QHBoxLayout()
+        theme_options.setSpacing(0)
+        self.theme_group = QButtonGroup(self)
+        self.theme_group.setExclusive(True)
+        current_theme = selected_theme()
+        theme_values = (("浅色", "light"), ("深色", "dark"), ("系统", "system"))
+        for index, (label, value) in enumerate(theme_values):
+            option = QPushButton(label)
+            option.setObjectName("themeOption")
+            option.setProperty("themeValue", value)
+            option.setProperty(
+                "segment",
+                "first" if index == 0 else "last" if index == len(theme_values) - 1 else "middle",
+            )
+            option.setCheckable(True)
+            option.setChecked(value == current_theme)
+            option.clicked.connect(
+                lambda checked=False, theme=value: (
+                    set_selected_theme(theme), apply_application_theme()
+                ) if checked else None
+            )
+            self.theme_group.addButton(option)
+            theme_options.addWidget(option)
+        theme_row.addLayout(theme_options)
+        layout.addLayout(theme_row)
+
+        update_row = QHBoxLayout()
+        update_row.setSpacing(12)
+        self.automatic_check = QCheckBox("自动检查更新")
+        self.automatic_check.setChecked(automatic_update_checks_enabled())
+        self.automatic_check.toggled.connect(set_automatic_update_checks_enabled)
+        update_row.addWidget(self.automatic_check)
+        update_row.addStretch()
+        self.check_update_button = QPushButton("立即检查更新")
+        self.check_update_button.setObjectName("outlineAction")
+        self.check_update_button.clicked.connect(lambda: on_check(True))
+        update_row.addWidget(self.check_update_button)
+        layout.addLayout(update_row)
+        logs_heading = QLabel("处理日志")
+        logs_heading.setObjectName("sectionLabel")
+        layout.addWidget(logs_heading)
+        log_buttons = QHBoxLayout()
+        show_log = QPushButton("查看处理日志")
+        show_log.setObjectName("outlineAction")
+        show_log.clicked.connect(on_show_log)
+        log_buttons.addWidget(show_log)
+        export_log = QPushButton("导出日志")
+        export_log.setObjectName("outlineAction")
+        export_log.clicked.connect(on_export_log)
+        log_buttons.addWidget(export_log)
+        log_buttons.addStretch()
+        layout.addLayout(log_buttons)
+        layout.addSpacing(2)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        close_button = QPushButton("完成")
+        close_button.setObjectName("primary")
+        close_button.clicked.connect(self.accept)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
+
+
+class AboutDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("关于我们")
+        self.setModal(True)
+        self.setFixedSize(500, 370)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(11)
+
+        name = QLabel(APP_NAME)
+        name.setObjectName("title")
+        layout.addWidget(name)
+        layout.addWidget(QLabel(f"版本 v{APP_VERSION}"))
+        developer = QLabel(f"开发者：{DEVELOPER_NAME}")
+        developer.setObjectName("sectionLabel")
+        layout.addWidget(developer)
+        company = QLabel(f"公司：{COMPANY_NAME}")
+        company.setObjectName("sectionLabel")
+        layout.addWidget(company)
+        layout.addWidget(QLabel(f"模型版本：{MODEL_VERSION}"))
+        layout.addWidget(QLabel(f"模型发布日期：{MODEL_RELEASE_DATE}"))
+        runtime = QLabel(f"运行方式：{MODEL_RUNTIME}")
+        runtime.setObjectName("muted")
+        layout.addWidget(runtime)
+        statement = QLabel(
+            "媒体扫描、人物识别和标签处理均在本地完成。"
+            "检查更新仅获取 GitHub 版本信息；“反馈与联系”仅打开联系页面。"
+            "软件不会自动上传图片、日志或文件名。"
+        )
+        statement.setObjectName("muted")
+        statement.setWordWrap(True)
+        layout.addWidget(statement)
+        layout.addStretch()
+
+        buttons = QHBoxLayout()
+        self.contact_button = QPushButton("反馈与联系")
+        self.contact_button.setObjectName("outlineAction")
+        self.contact_button.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(FEISHU_CONTACT_URL))
+        )
+        buttons.addWidget(self.contact_button)
+        project = QPushButton("GitHub 项目")
+        project.setObjectName("outlineAction")
+        project.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(GITHUB_PROJECT_URL))
+        )
+        buttons.addWidget(project)
+        buttons.addStretch()
+        close_button = QPushButton("关闭")
+        close_button.setObjectName("primary")
+        close_button.clicked.connect(self.accept)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+
+class UpdateDialog(QDialog):
+    cancelUpdateRequested = Signal()
+
+    def __init__(self, release: ReleaseInfo, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("软件更新")
+        self.setModal(True)
+        self.resize(520, 390)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setSpacing(12)
+
+        heading = QLabel(f"发现新版本 v{release.version}")
+        heading.setObjectName("sectionLabel")
+        layout.addWidget(heading)
+        current = QLabel(f"当前版本：v{APP_VERSION}")
+        current.setObjectName("muted")
+        layout.addWidget(current)
+
+        notes = QTextEdit()
+        notes.setReadOnly(True)
+        notes.setPlainText(release.notes.strip() or "本次版本包含功能优化和问题修复。")
+        layout.addWidget(notes, 1)
+
+        self.update_status = QLabel("点击“立即更新”后将在软件内下载并自动重启。")
+        self.update_status.setWordWrap(True)
+        self.update_status.setObjectName("muted")
+        layout.addWidget(self.update_status)
+        self.update_progress = QProgressBar()
+        self.update_progress.setRange(0, 1000)
+        self.update_progress.setValue(0)
+        self.update_progress.setTextVisible(False)
+        self.update_progress.hide()
+        layout.addWidget(self.update_progress)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        self.later_button = QPushButton("稍后")
+        self.later_button.setObjectName("outlineAction")
+        self.later_button.clicked.connect(self._handle_secondary_action)
+        buttons.addWidget(self.later_button)
+        self.install_button = QPushButton("立即更新")
+        self.install_button.setObjectName("primary")
+        buttons.addWidget(self.install_button)
+        layout.addLayout(buttons)
+
+        self.downloading = False
+
+    def _handle_secondary_action(self) -> None:
+        if self.downloading:
+            self.cancelUpdateRequested.emit()
+        else:
+            self.reject()
+
+    def reject(self) -> None:
+        if self.downloading:
+            self.cancelUpdateRequested.emit()
+            return
+        super().reject()
+
+    def set_downloading(self) -> None:
+        self.downloading = True
+        self.install_button.setEnabled(False)
+        self.later_button.setText("取消更新")
+        self.later_button.setEnabled(True)
+        self.update_progress.show()
+        self.update_status.setText("正在下载新版，请不要关闭软件……")
+
+    def set_cancel_pending(self) -> None:
+        self.update_status.setText("正在取消更新……")
+        self.later_button.setEnabled(False)
+
+    def set_cancelled(self) -> None:
+        self.downloading = False
+        self.update_progress.hide()
+        self.update_progress.setRange(0, 1000)
+        self.update_progress.setValue(0)
+        self.update_status.setText("更新已取消，未完成的下载文件已删除。")
+        self.install_button.setText("立即更新")
+        self.install_button.setEnabled(True)
+        self.later_button.setText("关闭")
+        self.later_button.setEnabled(True)
+
+    def set_ready_to_install(self, unsigned: bool = False) -> None:
+        self.downloading = False
+        self.update_progress.show()
+        self.update_progress.setRange(0, 1000)
+        self.update_progress.setValue(1000)
+        self.update_status.setText(
+            "下载和 SHA-256 校验已完成；安装包尚未数字签名，安装前会再次确认。"
+            if unsigned
+            else "下载和安全校验已完成，可以安装新版。"
+        )
+        self.install_button.setText("安装并重启")
+        self.install_button.setEnabled(True)
+        self.later_button.setText("稍后")
+        self.later_button.setEnabled(True)
+
+    def set_progress(self, completed: int, total: int) -> None:
+        if total > 0:
+            value = min(1000, round(1000 * completed / total))
+            self.update_progress.setRange(0, 1000)
+            self.update_progress.setValue(value)
+            self.update_status.setText(
+                f"正在下载新版：{completed / 1024 / 1024:.1f} / "
+                f"{total / 1024 / 1024:.1f} MB"
+            )
+        else:
+            self.update_progress.setRange(0, 0)
+
+    def set_error(self, message: str) -> None:
+        self.downloading = False
+        self.update_progress.setRange(0, 1000)
+        self.update_progress.setValue(0)
+        self.update_status.setText(message)
+        self.install_button.setEnabled(True)
+        self.install_button.setText("重试下载")
+        self.later_button.setEnabled(True)
+        self.later_button.setText("关闭")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+        self.setWindowTitle(APP_NAME)
         icon_path = bundled_path("assets/app-icon.ico")
         if not icon_path.is_file():
             icon_path = bundled_path("assets/app-icon.png")
@@ -611,6 +1240,7 @@ class MainWindow(QMainWindow):
         self.files: list[Path] = []
         self.tagged_file_keys: set[str] = set()
         self.file_statuses: dict[str, tuple[str, str]] = {}
+        self.status_filter = "all"
         self._list_items_by_key: dict[str, QListWidgetItem] = {}
         self._list_indexes_by_key: dict[str, int] = {}
         self._checked_count = 0
@@ -629,11 +1259,28 @@ class MainWindow(QMainWindow):
         self._recent_item_seconds: list[float] = []
         self.processing_current = 0
         self.processing_total = 0
+        self.available_release: ReleaseInfo | None = None
+        self._update_check_in_progress = False
+        self._update_download_in_progress = False
+        self._update_cancel_requested = threading.Event()
+        self._downloaded_update_path: Path | None = None
+        self._downloaded_update_signature: str | None = None
+        self._update_dialog: UpdateDialog | None = None
+        self.environment_issues: list[str] = []
+        self._restoring_session = False
         self._build_ui()
+        self._session_save_timer = QTimer(self)
+        self._session_save_timer.setSingleShot(True)
+        self._session_save_timer.timeout.connect(self._persist_session_state)
+        self._restore_session_state()
         self._load_latest_log()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._drain_events)
         self.timer.start(80)
+        if getattr(sys, "frozen", False) and should_check_automatically():
+            QTimer.singleShot(2500, self._start_update_check)
+        if getattr(sys, "frozen", False):
+            QTimer.singleShot(900, self._start_environment_check)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -672,6 +1319,100 @@ class MainWindow(QMainWindow):
         except (AttributeError, OSError, TypeError, ValueError):
             pass
 
+    def _start_environment_check(self) -> None:
+        def worker() -> None:
+            self.events.put(("environment_check_done", runtime_environment_issues()))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _schedule_session_save(self) -> None:
+        if self._restoring_session or persistent_session_path() is None:
+            return
+        self._session_save_timer.start(250)
+
+    def _persist_session_state(self) -> None:
+        state_path = persistent_session_path()
+        if state_path is None:
+            return
+        items: list[dict[str, object]] = []
+        for index, path in enumerate(self.files):
+            key = str(path).casefold()
+            item = self.list.item(index) if index < self.list.count() else None
+            status = self.file_statuses.get(key)
+            items.append({
+                "path": str(path),
+                "checked": bool(item is not None and item.checkState() == Qt.Checked),
+                "tagged": key in self.tagged_file_keys,
+                "status_text": status[0] if status else "",
+                "status_kind": status[1] if status else "",
+            })
+        payload = {"version": 1, "saved_at": int(time.time()), "items": items}
+        temporary = state_path.with_suffix(".tmp")
+        try:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            os.replace(temporary, state_path)
+        except OSError:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _restore_session_state(self) -> None:
+        state_path = persistent_session_path()
+        if state_path is None or not state_path.is_file():
+            return
+        try:
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            records = payload.get("items", []) if payload.get("version") == 1 else []
+            if not isinstance(records, list):
+                return
+        except (OSError, ValueError, AttributeError):
+            return
+
+        files: list[Path] = []
+        checked_keys: set[str] = set()
+        tagged_keys: set[str] = set()
+        statuses: dict[str, tuple[str, str]] = {}
+        for record in records[:50000]:
+            if not isinstance(record, dict):
+                continue
+            path = Path(str(record.get("path", "")))
+            try:
+                exists = path.is_file()
+            except OSError:
+                exists = False
+            if not exists or path.suffix.casefold() not in {".jpg", ".jpeg", ".png", ".mp4"}:
+                continue
+            key = str(path).casefold()
+            files.append(path)
+            if bool(record.get("tagged")):
+                tagged_keys.add(key)
+            text = str(record.get("status_text", ""))
+            kind = str(record.get("status_kind", ""))
+            if kind in {"pending", "processing"}:
+                text, kind = "未处理", "pending"
+                checked_keys.add(key)
+            elif bool(record.get("checked")):
+                checked_keys.add(key)
+            if text and kind:
+                statuses[key] = (text, kind)
+
+        if not files:
+            return
+        self._restoring_session = True
+        try:
+            self.files = files
+            self.tagged_file_keys = tagged_keys
+            self.file_statuses = statuses
+            self.refresh(checked_keys)
+            self.status.setText(f"已恢复上次任务：{len(files)} 个文件")
+        finally:
+            self._restoring_session = False
+
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -679,8 +1420,17 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(22, 24, 22, 22)
 
         header = QHBoxLayout()
+        header.setSpacing(10)
         title = QLabel(APP_NAME); title.setObjectName("title")
-        header.addWidget(title)
+        header.addWidget(title, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.update_badge = QPushButton("NEW")
+        self.update_badge.setObjectName("updateBadge")
+        self.update_badge.setFixedSize(44, 20)
+        self.update_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_badge.setToolTip("发现新版本，点击更新")
+        self.update_badge.clicked.connect(self.show_update_dialog)
+        self.update_badge.hide()
+        header.addWidget(self.update_badge, 0, Qt.AlignmentFlag.AlignTop)
         header.addStretch()
         outer.addLayout(header)
         outer.addSpacing(18)
@@ -693,10 +1443,6 @@ class MainWindow(QMainWindow):
         tag_row.addWidget(fixed_label)
         tag = QLabel(TAG_VALUE); tag.setObjectName("tag"); tag_row.addWidget(tag)
         tag_row.addStretch()
-        self.cleanup_button = QPushButton("撤销标签")
-        self.cleanup_button.setObjectName("outlineAction")
-        self.cleanup_button.clicked.connect(self.start_cleanup)
-        tag_row.addWidget(self.cleanup_button)
         layout.addLayout(tag_row)
 
         files_panel = QFrame(); files_panel.setObjectName("filesPanel")
@@ -704,6 +1450,34 @@ class MainWindow(QMainWindow):
         file_header = QWidget(); file_header.setObjectName("fileHeader")
         file_header_layout = QHBoxLayout(file_header); file_header_layout.setContentsMargins(14, 10, 14, 10)
         self.count = QLabel("已选择：0 / 0 个文件"); self.count.setObjectName("count"); file_header_layout.addWidget(self.count)
+        file_header_layout.addSpacing(18)
+        self.status_filter_group = QButtonGroup(self)
+        self.status_filter_group.setExclusive(True)
+        self.status_filter_buttons: dict[str, QPushButton] = {}
+        filter_options = (
+            ("全部", "all"),
+            ("已导出", "exported"),
+            ("未检测", "skipped"),
+            ("失败", "failure"),
+        )
+        for index, (label, value) in enumerate(filter_options):
+            option = QPushButton(label)
+            option.setObjectName("themeOption")
+            option.setProperty(
+                "segment",
+                "first" if index == 0 else "last" if index == len(filter_options) - 1 else "middle",
+            )
+            option.setCheckable(True)
+            option.setChecked(value == self.status_filter)
+            option.setFixedWidth(62 if value != "exported" else 72)
+            option.setVisible(False)
+            option.clicked.connect(
+                lambda checked=False, selected=value: self._set_status_filter(selected)
+                if checked else None
+            )
+            self.status_filter_group.addButton(option)
+            self.status_filter_buttons[value] = option
+            file_header_layout.addWidget(option)
         file_header_layout.addStretch()
         self.select_all_button = QPushButton("全选"); self.select_all_button.setObjectName("smallAction"); self.select_all_button.clicked.connect(self.check_all)
         self.select_none_button = QPushButton("取消全选"); self.select_none_button.setObjectName("smallAction"); self.select_none_button.clicked.connect(self.uncheck_all)
@@ -757,17 +1531,27 @@ class MainWindow(QMainWindow):
         action_layout.addWidget(self.progress)
 
         actionbar = QHBoxLayout()
-        log_button = QPushButton("查看处理日志"); log_button.setObjectName("outlineAction"); log_button.clicked.connect(self.show_log)
-        export_button = QPushButton("导出日志"); export_button.setObjectName("outlineAction"); export_button.clicked.connect(self.export_log)
-        self.contact_button = QPushButton("反馈与联系")
-        self.contact_button.setObjectName("contactAction")
-        self.contact_button.clicked.connect(self.open_contact)
-        actionbar.addWidget(log_button); actionbar.addWidget(export_button); actionbar.addWidget(self.contact_button); actionbar.addStretch()
+        self.settings_button = QPushButton("⚙ 设置")
+        self.settings_button.setObjectName("outlineAction")
+        self.settings_button.setFixedSize(110, 42)
+        self.settings_button.clicked.connect(self.show_settings_dialog)
+        actionbar.addWidget(self.settings_button)
+        self.about_button = QPushButton("关于我们")
+        self.about_button.setObjectName("outlineAction")
+        self.about_button.setFixedSize(110, 42)
+        self.about_button.clicked.connect(self.show_about_dialog)
+        actionbar.addWidget(self.about_button)
+        actionbar.addStretch()
         self.stop_button = QPushButton("安全停止")
         self.stop_button.setObjectName("stopAction")
         self.stop_button.setFixedSize(110, 42)
         self.stop_button.clicked.connect(self.request_stop)
         actionbar.addWidget(self.stop_button)
+        self.cleanup_button = QPushButton("撤销标签")
+        self.cleanup_button.setObjectName("outlineAction")
+        self.cleanup_button.setFixedSize(110, 42)
+        self.cleanup_button.clicked.connect(self.start_cleanup)
+        actionbar.addWidget(self.cleanup_button)
         self.start_button = QPushButton("导出已勾选（0）"); self.start_button.setObjectName("secondaryAction"); self.start_button.setFixedSize(205, 42); self.start_button.clicked.connect(self.start)
         actionbar.addWidget(self.start_button)
         self.smart_button = QPushButton("智能识别并导出")
@@ -790,6 +1574,12 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
 
     def closeEvent(self, event: QCloseEvent):
+        if self._update_download_in_progress:
+            QMessageBox.information(
+                self, APP_NAME, "新版正在下载，请等待更新完成后再关闭软件。"
+            )
+            event.ignore()
+            return
         if self.importing:
             QMessageBox.information(self, APP_NAME, "正在导入文件，请等待扫描完成后再关闭程序。")
             event.ignore()
@@ -802,7 +1592,174 @@ class MainWindow(QMainWindow):
             flush_cache = getattr(self._detector, "flush_cache", None)
             if flush_cache is not None:
                 flush_cache()
+        if self._session_save_timer.isActive():
+            self._session_save_timer.stop()
+        self._persist_session_state()
+        self.timer.stop()
         event.accept()
+
+    def _start_update_check(self, manual: bool = False) -> None:
+        if self._update_check_in_progress:
+            return
+        self._update_check_in_progress = True
+
+        def worker() -> None:
+            try:
+                release = fetch_latest_release()
+                record_successful_check()
+                if is_newer_version(release.version, APP_VERSION):
+                    self.events.put(("update_available", release))
+                elif manual:
+                    self.events.put(("update_current",))
+            except UpdateError as exc:
+                if manual:
+                    self.events.put(("update_check_error", str(exc)))
+            finally:
+                self.events.put(("update_check_finished",))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def show_settings_dialog(self) -> None:
+        dialog: SettingsDialog | None = None
+
+        def check_now(_manual: bool = True) -> None:
+            if dialog is not None:
+                dialog.accept()
+            self._start_update_check(manual=True)
+
+        def show_logs() -> None:
+            if dialog is not None:
+                dialog.accept()
+            self.show_log()
+
+        def export_logs() -> None:
+            if dialog is not None:
+                dialog.accept()
+            self.export_log()
+
+        dialog = SettingsDialog(check_now, show_logs, export_logs, self)
+        dialog.exec()
+
+    def show_about_dialog(self) -> None:
+        AboutDialog(self).exec()
+
+    def show_update_dialog(self) -> None:
+        release = self.available_release
+        if release is None:
+            return
+        dialog = UpdateDialog(release, self)
+        dialog.install_button.clicked.connect(self.handle_update_action)
+        dialog.cancelUpdateRequested.connect(self.request_cancel_update)
+        self._update_dialog = dialog
+        if self._downloaded_update_path is not None and self._downloaded_update_path.is_file():
+            dialog.set_ready_to_install(
+                unsigned=self._downloaded_update_signature == "NotSigned"
+            )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def handle_update_action(self) -> None:
+        downloaded = self._downloaded_update_path
+        if downloaded is not None and downloaded.is_file():
+            unsigned = self._downloaded_update_signature == "NotSigned"
+            message = (
+                "新版安装包尚未获得数字签名，但已通过 GitHub Release 提供的 "
+                "SHA-256 完整性校验。Windows 可能显示 SmartScreen 提醒。\n\n"
+                "仅当更新来自本软件内置的官方 GitHub 地址时才继续安装。现在是否继续？"
+                if unsigned
+                else
+                "新版已下载并完成安全校验。现在将关闭软件、安装新版并重新启动，是否继续？"
+            )
+            answer = QMessageBox.question(
+                self,
+                "安装更新",
+                message,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                (
+                    QMessageBox.StandardButton.No
+                    if unsigned
+                    else QMessageBox.StandardButton.Yes
+                ),
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._install_downloaded_update(downloaded)
+            return
+        self.begin_update_download()
+
+    def request_cancel_update(self) -> None:
+        if not self._update_download_in_progress:
+            return
+        self._update_cancel_requested.set()
+        if self._update_dialog is not None:
+            self._update_dialog.set_cancel_pending()
+
+    def begin_update_download(self) -> None:
+        release = self.available_release
+        dialog = self._update_dialog
+        if release is None or dialog is None or self._update_download_in_progress:
+            return
+        if self.running or self.importing:
+            QMessageBox.information(
+                self,
+                APP_NAME,
+                "请等待当前导入或处理任务完成后再更新。",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "确认更新",
+            f"即将下载 v{release.version}。下载完成后软件会自动关闭并重新启动，是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._update_download_in_progress = True
+        self._update_cancel_requested.clear()
+        self._downloaded_update_path = None
+        self._downloaded_update_signature = None
+        dialog.set_downloading()
+
+        def worker() -> None:
+            try:
+                downloaded = download_release(
+                    release,
+                    lambda completed, total: self.events.put(
+                        ("update_download_progress", completed, total)
+                    ),
+                    cancelled=self._update_cancel_requested.is_set,
+                )
+                if self._update_cancel_requested.is_set():
+                    downloaded.unlink(missing_ok=True)
+                    raise UpdateCancelled("已取消更新。")
+                signature = authenticode_status(downloaded)
+                if self._update_cancel_requested.is_set():
+                    downloaded.unlink(missing_ok=True)
+                    raise UpdateCancelled("已取消更新。")
+                if not is_installable_signature_status(signature):
+                    downloaded.unlink(missing_ok=True)
+                    raise UpdateError(
+                        "新版数字签名状态异常，已停止安装。"
+                    )
+                self.events.put(("update_downloaded", downloaded, signature))
+            except UpdateCancelled:
+                self.events.put(("update_download_cancelled",))
+            except (OSError, UpdateError) as exc:
+                self.events.put(("update_download_error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _install_downloaded_update(self, downloaded: Path) -> None:
+        try:
+            launch_installer(downloaded)
+        except UpdateError as exc:
+            self._update_download_in_progress = False
+            if self._update_dialog is not None:
+                self._update_dialog.set_error(str(exc))
+            QMessageBox.critical(self, APP_NAME, str(exc))
+            return
+        QApplication.quit()
 
     def choose_files(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "选择媒体文件", "", "支持的媒体 (*.jpg *.jpeg *.png *.mp4);;所有文件 (*.*)")
@@ -882,6 +1839,8 @@ class MainWindow(QMainWindow):
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
             self.progress_text.setText("0%")
+            self.status_filter = "all"
+            self.status_filter_buttons["all"].setChecked(True)
             self.refresh(set())
 
     def remove_selected_files(self):
@@ -904,6 +1863,32 @@ class MainWindow(QMainWindow):
             self.file_statuses.pop(key, None)
         self.status.setText(f"已从列表移除 {len(valid_rows)} 个文件；原文件未删除")
 
+    def _set_status_filter(self, value: str) -> None:
+        self.status_filter = value if value in {"all", "exported", "skipped", "failure"} else "all"
+        self._apply_status_filter()
+
+    def _status_matches_filter(self, status: tuple[str, str] | None) -> bool:
+        if self.status_filter == "all":
+            return True
+        if status is None:
+            return False
+        text, kind = status
+        if self.status_filter == "exported":
+            return text in {"已导出", "已有标签"}
+        if self.status_filter == "skipped":
+            return text == "未检测到人物"
+        return kind == "failure"
+
+    def _apply_status_filter(self) -> None:
+        for index, path in enumerate(self.files):
+            item = self.list.item(index)
+            if item is not None:
+                item.setHidden(
+                    not self._status_matches_filter(
+                        self.file_statuses.get(str(path).casefold())
+                    )
+                )
+
     def refresh(self, checked_keys: set[str] | None = None):
         if checked_keys is None:
             checked_keys = {str(path).casefold() for path in self.files}
@@ -916,7 +1901,8 @@ class MainWindow(QMainWindow):
             for index, path in enumerate(self.files):
                 key = str(path).casefold()
                 item = QListWidgetItem(f"{path.name}\n{path.parent}")
-                item.setSizeHint(QSize(0, 54))
+                row_height = max(64, self.list.fontMetrics().lineSpacing() * 2 + 24)
+                item.setSizeHint(QSize(0, row_height))
                 item.setToolTip(str(path))
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
                 item.setCheckState(Qt.Checked if key in checked_keys else Qt.Unchecked)
@@ -935,8 +1921,12 @@ class MainWindow(QMainWindow):
             self.list.blockSignals(False)
             self.list.setUpdatesEnabled(True)
         self.list_stack.setCurrentIndex(1 if self.files else 0)
+        for button in self.status_filter_buttons.values():
+            button.setVisible(bool(self.files))
+        self._apply_status_filter()
         self.update_checked_count()
         self.status.setText("文件已就绪" if self.files else "等待添加文件")
+        self._schedule_session_save()
 
     def _set_file_status(self, path: Path, text: str, kind: str) -> None:
         key = str(path).casefold()
@@ -949,6 +1939,8 @@ class MainWindow(QMainWindow):
                 # Do not recenter on every file. Advance the viewport only
                 # when the active row would otherwise fall below its bottom.
                 self.list.scrollToItem(item, QAbstractItemView.EnsureVisible)
+        self._apply_status_filter()
+        self._schedule_session_save()
 
     def _set_file_checked(self, path: Path, checked: bool) -> None:
         item = self._list_items_by_key.get(str(path).casefold())
@@ -967,6 +1959,7 @@ class MainWindow(QMainWindow):
         self._checked_count = max(0, min(self._checked_count, len(self.files)))
         self.count.setText(f"已选择：{self._checked_count} / {len(self.files)} 个文件")
         self.start_button.setText(f"导出已勾选（{self._checked_count}）")
+        self._schedule_session_save()
 
     def _replace_file_path(self, source: Path, replacement: Path) -> Path:
         """Keep a completed row and point it at the verified output file."""
@@ -986,6 +1979,7 @@ class MainWindow(QMainWindow):
         self.tagged_file_keys.discard(old_key)
         item.setText(f"{new_path.name}\n{new_path.parent}")
         item.setToolTip(str(new_path))
+        self._schedule_session_save()
         return new_path
 
     def _prepare_file_statuses(self, files: list[Path]) -> None:
@@ -1098,6 +2092,7 @@ class MainWindow(QMainWindow):
     def _on_item_changed(self, item: QListWidgetItem):
         item.setSelected(item.checkState() == Qt.Checked)
         self.update_checked_count()
+        self._schedule_session_save()
 
     def check_all(self):
         self._set_all_checked(Qt.Checked)
@@ -1116,6 +2111,7 @@ class MainWindow(QMainWindow):
         finally:
             self.list.blockSignals(False)
         self.update_checked_count()
+        self._schedule_session_save()
 
     def start(self):
         if self.running:
@@ -1518,6 +2514,7 @@ class MainWindow(QMainWindow):
     def _begin_persistent_log(self) -> None:
         """Create an auto-saved task log that survives application restarts."""
         try:
+            migrate_legacy_logs()
             folder = persistent_log_directory()
             folder.mkdir(parents=True, exist_ok=True)
             stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -1591,6 +2588,53 @@ class MainWindow(QMainWindow):
                         self._show_processing_progress()
                     else:
                         self.status.setText(event[1])
+                elif event[0] == "update_available":
+                    self.available_release = event[1]
+                    self.update_badge.setToolTip(
+                        f"发现新版本 v{event[1].version}，点击更新"
+                    )
+                    self.update_badge.show()
+                elif event[0] == "update_current":
+                    QMessageBox.information(
+                        self, APP_NAME, f"当前已是最新版本 v{APP_VERSION}。"
+                    )
+                elif event[0] == "update_check_error":
+                    QMessageBox.warning(self, APP_NAME, event[1])
+                elif event[0] == "update_check_finished":
+                    self._update_check_in_progress = False
+                elif event[0] == "environment_check_done":
+                    self.environment_issues = list(event[1])
+                    if self.environment_issues:
+                        QMessageBox.warning(
+                            self,
+                            "运行环境检查",
+                            "发现以下问题：\n\n"
+                            + "\n".join(f"• {issue}" for issue in self.environment_issues)
+                            + "\n\n请重新安装软件，或检查磁盘空间与目录权限。",
+                        )
+                elif event[0] == "update_download_progress":
+                    if self._update_dialog is not None:
+                        self._update_dialog.set_progress(event[1], event[2])
+                elif event[0] == "update_download_error":
+                    self._update_download_in_progress = False
+                    self._downloaded_update_signature = None
+                    if self._update_dialog is not None:
+                        self._update_dialog.set_error(event[1])
+                    QMessageBox.warning(self, APP_NAME, event[1])
+                elif event[0] == "update_download_cancelled":
+                    self._update_download_in_progress = False
+                    self._downloaded_update_path = None
+                    self._downloaded_update_signature = None
+                    if self._update_dialog is not None:
+                        self._update_dialog.set_cancelled()
+                elif event[0] == "update_downloaded":
+                    self._update_download_in_progress = False
+                    self._downloaded_update_path = event[1]
+                    self._downloaded_update_signature = event[2]
+                    if self._update_dialog is not None:
+                        self._update_dialog.set_ready_to_install(
+                            unsigned=event[2] == "NotSigned"
+                        )
                 elif event[0] == "file_status":
                     _, source, text, kind, *progress = event
                     self._set_file_status(source, text, kind)
@@ -1897,7 +2941,7 @@ class MainWindow(QMainWindow):
 
     def open_contact(self):
         """Open the contact page predictably in the default browser."""
-        if not QDesktopServices.openUrl(QUrl(CONTACT_URL)):
+        if not QDesktopServices.openUrl(QUrl(FEISHU_CONTACT_URL)):
             QMessageBox.warning(self, APP_NAME, "无法打开联系页面，请检查默认浏览器设置。")
 
 
@@ -1928,6 +2972,8 @@ def main():
         except Exception as exc:
             Path(self_test_result).write_text(f"success=False\nmessage={exc}", encoding="utf-8")
         return
+    if getattr(sys, "frozen", False):
+        clear_legacy_unsigned_update_override()
     configure_windows_app_identity()
     app = QApplication(sys.argv)
     icon_path = bundled_path("assets/app-icon.ico")
@@ -1935,7 +2981,14 @@ def main():
         icon_path = bundled_path("assets/app-icon.png")
     if icon_path.is_file():
         app.setWindowIcon(QIcon(str(icon_path)))
-    app.setStyleSheet(STYLE)
+    apply_application_theme()
+    try:
+        app.styleHints().colorSchemeChanged.connect(
+            lambda _scheme: apply_application_theme()
+            if selected_theme() == "system" else None
+        )
+    except AttributeError:
+        pass
     window = MainWindow()
     instance = SingleInstanceController(single_instance_server_name(), lambda: activate_main_window(window))
     if not instance.acquire_or_notify():

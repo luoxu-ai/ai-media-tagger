@@ -15,7 +15,7 @@ from typing import Iterable
 
 
 APP_NAME = "AI 媒体标签工具"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.2"
 TAG_VALUE = "contains-synthetic-performer"
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".mp4"}
 FILE_RETRY_DELAYS = (0.5, 1.0, 2.0)
@@ -135,7 +135,7 @@ class ExifToolService:
         file_args = args[2:] if args[:2] == ["-charset", "filename=UTF8"] else args
         # Feed the UTF-8 argument file through stdin. A disk-backed argument
         # file inside %TEMP% breaks when the Windows user profile contains
-        # non-ASCII characters (for example C:\Users\测试用户).
+        # non-ASCII characters (for example C:\Users\CBT-美工).
         argfile_text = "\n".join(file_args) + "\n"
         command = [str(self.executable), "-charset", "filename=UTF8", "-@", "-"]
         if getattr(sys, "_MEIPASS", None) and perl_lib.is_dir():

@@ -14,8 +14,13 @@ from PySide6.QtWidgets import QApplication, QAbstractItemView
 
 from core import TagResult
 from person_detector import DetectionResult
+from update_manager import ReleaseInfo
+import qt_app
 from qt_app import (
-    CONTACT_URL,
+    AboutDialog,
+    SettingsDialog,
+    UpdateDialog,
+    FEISHU_CONTACT_URL,
     FILE_STATUS_KIND_ROLE,
     FILE_STATUS_TEXT_ROLE,
     WINDOWS_APP_USER_MODEL_ID,
@@ -47,6 +52,42 @@ class QtBehaviorTests(unittest.TestCase):
         self.assertTrue(WINDOWS_APP_USER_MODEL_ID.isascii())
         self.assertEqual(WINDOWS_APP_USER_MODEL_ID, "CBT.AIMediaTagTool")
         configure_windows_app_identity()
+
+    def test_main_window_title_hides_version_number(self):
+        window = MainWindow()
+        try:
+            self.assertEqual(window.windowTitle(), "AI 媒体标签工具")
+            self.assertNotIn("v1.2.1", window.windowTitle())
+        finally:
+            window.close()
+
+    def test_frozen_build_keeps_and_migrates_logs_beside_executable(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            install = root / "安装目录"
+            install.mkdir()
+            executable = install / "AI媒体标签工具.exe"
+            executable.touch()
+            local_app_data = root / "LocalAppData"
+            legacy = local_app_data / "AI媒体标签工具" / "logs"
+            legacy.mkdir(parents=True)
+            old_log = legacy / "AI媒体标签导出报告_20260801_120000.txt"
+            old_log.write_text("旧版日志", encoding="utf-8-sig")
+
+            with (
+                patch.object(qt_app.sys, "frozen", True, create=True),
+                patch.object(qt_app.sys, "executable", str(executable)),
+                patch.dict(os.environ, {"LOCALAPPDATA": str(local_app_data)}),
+                patch.object(qt_app, "_LOG_MIGRATION_ATTEMPTED", False),
+            ):
+                expected = install.resolve() / "logs"
+                self.assertEqual(qt_app.persistent_log_directory(), expected)
+                qt_app.migrate_legacy_logs()
+                self.assertEqual(
+                    (expected / old_log.name).read_text(encoding="utf-8-sig"),
+                    "旧版日志",
+                )
+                self.assertTrue(old_log.exists())
 
     def test_second_instance_notifies_first(self):
         name = f"ai_media_tagger_test_{os.getpid()}_{time.time_ns()}"
@@ -102,6 +143,68 @@ class QtBehaviorTests(unittest.TestCase):
             self.assertEqual(window.cleanup_button.text(), "撤销标签")
         finally:
             window.close()
+
+    def test_new_badge_appears_only_after_a_new_release_event(self):
+        window = MainWindow()
+        try:
+            self.assertTrue(window.update_badge.isHidden())
+            release = ReleaseInfo(
+                "9.9.9",
+                "测试更新",
+                "https://example.test/setup.exe",
+                "a" * 64,
+                100,
+                "https://example.test/release",
+                "AI媒体标签工具安装程序.exe",
+            )
+            window.events.put(("update_available", release))
+            window._drain_events()
+            self.assertFalse(window.update_badge.isHidden())
+            self.assertIs(window.available_release, release)
+            self.assertIn("v9.9.9", window.update_badge.toolTip())
+        finally:
+            window.close()
+
+    def test_update_dialog_can_cancel_and_requires_a_second_install_action(self):
+        release = ReleaseInfo(
+            "1.2.2",
+            "更新测试",
+            "https://example.test/setup.exe",
+            "a" * 64,
+            100,
+            "https://example.test/release",
+            "AI-Media-Tagger-Setup.exe",
+        )
+        dialog = UpdateDialog(release)
+        try:
+            dialog.set_downloading()
+            self.assertEqual(dialog.later_button.text(), "取消更新")
+            self.assertTrue(dialog.later_button.isEnabled())
+            self.assertFalse(dialog.install_button.isEnabled())
+
+            dialog.set_cancelled()
+            self.assertEqual(dialog.update_status.text(), "更新已取消，未完成的下载文件已删除。")
+            self.assertEqual(dialog.install_button.text(), "立即更新")
+
+            dialog.set_ready_to_install()
+            self.assertEqual(dialog.install_button.text(), "安装并重启")
+            self.assertTrue(dialog.install_button.isEnabled())
+            self.assertIn("校验已完成", dialog.update_status.text())
+        finally:
+            dialog.close()
+
+    def test_settings_offer_system_light_and_dark_themes(self):
+        dialog = SettingsDialog(lambda *_: None, lambda: None, lambda: None)
+        try:
+            options = [
+                button.property("themeValue")
+                for button in dialog.theme_group.buttons()
+            ]
+            self.assertEqual(options, ["light", "dark", "system"])
+            self.assertEqual(dialog.automatic_check.text(), "自动检查更新")
+            self.assertEqual(dialog.check_update_button.text(), "立即检查更新")
+        finally:
+            dialog.close()
 
     def test_file_list_replaces_combined_add_file_empty_state(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -233,19 +336,18 @@ class QtBehaviorTests(unittest.TestCase):
             window.close()
 
     def test_contact_button_always_uses_default_browser(self):
-        window = MainWindow()
+        dialog = AboutDialog()
         try:
-            self.assertEqual(
-                CONTACT_URL,
-                "https://github.com/luoxu-ai/ai-media-tagger/issues/new",
-            )
+            self.assertIn("feishu.cn/invitation/page/add_contact/", FEISHU_CONTACT_URL)
+            self.assertNotIn("unique_id=", FEISHU_CONTACT_URL)
+            self.assertNotIn("&amp;", FEISHU_CONTACT_URL)
             with patch("qt_app.QDesktopServices.openUrl", return_value=True) as open_url:
-                window.contact_button.click()
+                dialog.contact_button.click()
             opened = open_url.call_args.args[0].toString()
-            self.assertIn("github.com/luoxu-ai/ai-media-tagger/issues/new", opened)
+            self.assertIn("feishu.cn/invitation/page/add_contact/", opened)
             self.assertNotIn("unique_id=", opened)
         finally:
-            window.close()
+            dialog.close()
 
     def test_file_row_shows_filename_and_parent_path(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -280,6 +382,19 @@ class QtBehaviorTests(unittest.TestCase):
             item = window.list.item(0)
             self.assertEqual(item.data(FILE_STATUS_TEXT_ROLE), "处理中")
             self.assertEqual(item.data(FILE_STATUS_KIND_ROLE), "processing")
+        finally:
+            window.close()
+
+    def test_file_row_reserves_two_lines_at_scaled_font_height(self):
+        source = Path("C:/samples/很长的中文目录/CBT1628_02_卖点图_主要配件，简便还原.jpg")
+        window = MainWindow()
+        try:
+            window.files = [source]
+            window.refresh({str(source).casefold()})
+            item = window.list.item(0)
+            required = window.list.fontMetrics().lineSpacing() * 2 + 24
+            self.assertGreaterEqual(item.sizeHint().height(), 64)
+            self.assertGreaterEqual(item.sizeHint().height(), required)
         finally:
             window.close()
 
@@ -449,7 +564,7 @@ class QtBehaviorTests(unittest.TestCase):
             window.close()
 
     def test_file_list_renders_2000_unicode_paths_within_reasonable_time(self):
-        root = Path(r"D:\公开测试数据\测试目录_中文")
+        root = Path(r"G:\AI训练\测试目录_中文")
         paths = [root / f"商品图_{index:04d}.jpg" for index in range(2000)]
         window = MainWindow()
         try:
@@ -624,6 +739,111 @@ class QtBehaviorTests(unittest.TestCase):
                 self.assertIn("1 个已有标签文件保持未勾选", window.status.text())
             finally:
                 window.close()
+
+    def test_result_filters_show_only_matching_rows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            paths = [root / f"sample_{index}.jpg" for index in range(4)]
+            for path in paths:
+                path.write_bytes(b"image")
+            window = MainWindow()
+            try:
+                window.files = paths
+                window.refresh({str(path).casefold() for path in paths})
+                window._set_file_status(paths[0], "已导出", "success")
+                window._set_file_status(paths[1], "未检测到人物", "skipped")
+                window._set_file_status(paths[2], "处理失败", "failure")
+
+                window._set_status_filter("exported")
+                self.assertEqual(
+                    [window.list.item(index).isHidden() for index in range(4)],
+                    [False, True, True, True],
+                )
+                window._set_status_filter("skipped")
+                self.assertEqual(
+                    [window.list.item(index).isHidden() for index in range(4)],
+                    [True, False, True, True],
+                )
+                window._set_status_filter("failure")
+                self.assertEqual(
+                    [window.list.item(index).isHidden() for index in range(4)],
+                    [True, True, False, True],
+                )
+                window._set_status_filter("all")
+                self.assertFalse(any(window.list.item(index).isHidden() for index in range(4)))
+            finally:
+                window.close()
+
+    def test_last_task_is_restored_and_interrupted_rows_return_to_pending(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            state_path = root / "last_task.json"
+            paths = [root / f"restore_{index}.jpg" for index in range(3)]
+            for path in paths:
+                path.write_bytes(b"image")
+            with patch("qt_app.persistent_session_path", return_value=state_path):
+                first = MainWindow()
+                try:
+                    first.files = paths
+                    first.tagged_file_keys = {str(paths[0]).casefold()}
+                    first.file_statuses = {
+                        str(paths[0]).casefold(): ("已导出", "success"),
+                        str(paths[1]).casefold(): ("处理中", "processing"),
+                        str(paths[2]).casefold(): ("未检测到人物", "skipped"),
+                    }
+                    first.refresh({str(paths[1]).casefold()})
+                    first._persist_session_state()
+                finally:
+                    first.close()
+
+                restored = MainWindow()
+                try:
+                    self.assertEqual(restored.files, paths)
+                    self.assertEqual(
+                        restored.file_statuses[str(paths[0]).casefold()],
+                        ("已导出", "success"),
+                    )
+                    self.assertEqual(
+                        restored.file_statuses[str(paths[1]).casefold()],
+                        ("未处理", "pending"),
+                    )
+                    self.assertEqual(restored.list.item(1).checkState(), Qt.Checked)
+                    self.assertEqual(
+                        restored.file_statuses[str(paths[2]).casefold()],
+                        ("未检测到人物", "skipped"),
+                    )
+                    self.assertIn("已恢复上次任务", restored.status.text())
+                finally:
+                    restored.close()
+
+    def test_runtime_environment_check_accepts_complete_runtime(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for relative in qt_app.MODEL_RELATIVE_PATHS:
+                model = root / relative
+                model.parent.mkdir(parents=True, exist_ok=True)
+                model.write_bytes(b"model")
+            exiftool = root / "exiftool.exe"
+            exiftool.write_bytes(b"tool")
+            logs = root / "logs"
+            with (
+                patch("qt_app.bundled_path", side_effect=lambda relative: root / relative),
+                patch("qt_app.find_exiftool", return_value=exiftool),
+                patch("qt_app.persistent_log_directory", return_value=logs),
+            ):
+                self.assertEqual(qt_app.runtime_environment_issues(), [])
+
+    def test_about_dialog_includes_company_and_model_details(self):
+        dialog = AboutDialog()
+        try:
+            text = "\n".join(label.text() for label in dialog.findChildren(qt_app.QLabel))
+            self.assertIn("开发者：Xu Luo", text)
+            self.assertIn(f"模型版本：{qt_app.MODEL_VERSION}", text)
+            self.assertIn(f"模型发布日期：{qt_app.MODEL_RELEASE_DATE}", text)
+            self.assertIn(f"运行方式：{qt_app.MODEL_RUNTIME}", text)
+            self.assertIn("公司：深圳市艾润特贸易有限公司", text)
+        finally:
+            dialog.close()
 
 
 if __name__ == "__main__":

@@ -74,6 +74,36 @@ def test_second_stage_verifier_keeps_a_reviewed_positive():
     assert "图像级复检" in reason
 
 
+def test_uncertain_image_level_result_requires_local_confirmation():
+    detector = PersonDetector.__new__(PersonDetector)
+    detector.enable_tiles = True
+    detector.image_level_local_threshold = 0.14
+    detector._presence_score = lambda image: 0.13
+    detector._verifier_score = lambda image: 0.63
+
+    confirmed, score = detector._locally_confirms_image_level_person(
+        Image.new("RGB", (1000, 1000))
+    )
+
+    assert not confirmed
+    assert score == 0.13
+
+
+def test_uncertain_image_level_result_keeps_local_person_evidence():
+    detector = PersonDetector.__new__(PersonDetector)
+    detector.enable_tiles = True
+    detector.image_level_local_threshold = 0.14
+    detector._presence_score = lambda image: 0.20
+    detector._verifier_score = lambda image: 0.15
+
+    confirmed, score = detector._locally_confirms_image_level_person(
+        Image.new("RGB", (1000, 1000))
+    )
+
+    assert confirmed
+    assert score == 0.15
+
+
 def test_high_confidence_standalone_hand_vetoes_image_level_fallback():
     detector = PersonDetector.__new__(PersonDetector)
     detector.face_threshold = 0.92

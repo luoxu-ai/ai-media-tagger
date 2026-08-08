@@ -28,6 +28,15 @@ STANDALONE_PART_VETO_THRESHOLD = 0.85
 STANDALONE_PART_VERIFIER_MAX = 0.40
 MULTI_PERSON_CONFIRMATION_COUNT = 2
 DETECTION_CACHE_VERSION = "20260729-small-person-v2"
+MODEL_VERSION = "2026.07.29-v2"
+MODEL_RELEASE_DATE = "2026-07-29"
+MODEL_RUNTIME = "CPU 离线识别"
+MODEL_RELATIVE_PATHS = (
+    "models/dfine_m_human_parts_trial.onnx",
+    "models/face_detection_yunet_2023mar.onnx",
+    "models/presence_classifier_efficientnet_b0.onnx",
+    "models/presence_classifier_verifier_final.onnx",
+)
 PRESENCE_MEAN = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
 PRESENCE_STD = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -184,6 +193,8 @@ class PersonDetector:
         tiled_face_threshold: float = 0.95,
         presence_threshold: float = 0.12,
         verifier_threshold: float = 0.35,
+        image_level_local_check_below: float = 0.75,
+        image_level_local_threshold: float = 0.14,
         human_confirmation_threshold: float = 0.02,
         enable_tiles: bool = True,
         tile_trigger_threshold: float = 0.08,
@@ -194,19 +205,22 @@ class PersonDetector:
         self.tiled_face_threshold = max(face_threshold, tiled_face_threshold)
         self.presence_threshold = presence_threshold
         self.verifier_threshold = verifier_threshold
+        self.image_level_local_check_below = image_level_local_check_below
+        self.image_level_local_threshold = image_level_local_threshold
         self.human_confirmation_threshold = human_confirmation_threshold
         self.enable_tiles = enable_tiles
         self.tile_trigger_threshold = tile_trigger_threshold
-        detector_path = bundled_path("models/dfine_m_human_parts_trial.onnx")
-        face_path = bundled_path("models/face_detection_yunet_2023mar.onnx")
-        presence_path = bundled_path("models/presence_classifier_efficientnet_b0.onnx")
-        verifier_path = bundled_path("models/presence_classifier_verifier_final.onnx")
+        detector_path, face_path, presence_path, verifier_path = (
+            bundled_path(relative) for relative in MODEL_RELATIVE_PATHS
+        )
         self.cache_version = (
             f"{DETECTION_CACHE_VERSION}:"
             f"{hashlib.sha256(verifier_path.read_bytes()).hexdigest()[:16]}:"
             f"{self.detection_threshold:.3f}:{self.face_threshold:.3f}:"
             f"{self.verifier_threshold:.3f}:{self.human_confirmation_threshold:.3f}:"
-            f"{self.tile_trigger_threshold:.3f}"
+            f"{self.tile_trigger_threshold:.3f}:"
+            f"{self.image_level_local_check_below:.3f}:"
+            f"{self.image_level_local_threshold:.3f}"
         ) if verifier_path.is_file() else DETECTION_CACHE_VERSION
         self.cache_path = cache_path or self._default_cache_path()
         self._cache: dict[str, dict] = self._load_cache()
@@ -433,6 +447,22 @@ class PersonDetector:
         probabilities = np.exp(logits)
         return float(probabilities[1] / probabilities.sum())
 
+    def _locally_confirms_image_level_person(self, image: Image.Image) -> tuple[bool, float]:
+        """Confirm an uncertain full-image result in at least one local crop."""
+        threshold = getattr(self, "image_level_local_threshold", None)
+        if threshold is None or not getattr(self, "enable_tiles", True):
+            return True, 1.0
+        tiles = list(_tiles(image))
+        if not tiles:
+            return True, 1.0
+        best_joint_score = 0.0
+        for tile in tiles:
+            joint_score = min(self._presence_score(tile), self._verifier_score(tile))
+            best_joint_score = max(best_joint_score, joint_score)
+            if joint_score >= threshold:
+                return True, best_joint_score
+        return False, best_joint_score
+
     def _evaluate_view(self, image: Image.Image, tiled: bool = False) -> tuple[bool, float, str]:
         face_score = self._face_score(image)
         required_face_score = self.tiled_face_threshold if tiled else self.face_threshold
@@ -483,6 +513,16 @@ class PersonDetector:
             ):
                 return False, max(person.part_confidence, presence_score), ""
             if verifier_score >= getattr(self, "verifier_threshold", 0.35):
+                local_check_below = getattr(
+                    self, "image_level_local_check_below", None
+                )
+                if local_check_below is not None and verifier_score < local_check_below:
+                    locally_confirmed, local_score = (
+                        self._locally_confirms_image_level_person(image)
+                    )
+                    self._last_stage_details += f"; local_check={local_score:.3f}"
+                    if not locally_confirmed:
+                        return False, max(presence_score, verifier_score), ""
                 return True, presence_score, "图像级复检确认包含人物或大面积人体区域"
         else:
             self._last_stage_details = (

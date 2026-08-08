@@ -1,4 +1,4 @@
-name: Build Windows executable
+name: Build Windows installer
 
 on:
   workflow_dispatch:
@@ -24,37 +24,41 @@ jobs:
 
       - name: Prepare pinned dependencies and ExifTool
         shell: pwsh
-        run: .\prepare.ps1
+        run: |
+          python -m venv .train_venv
+          .\prepare.ps1
 
       - name: Run automated tests
         shell: pwsh
-        run: .\.venv\Scripts\python.exe -m pytest -q
+        run: .\.train_venv\Scripts\python.exe -m pytest -q
 
-      - name: Build Windows executable
+      - name: Build Windows application
         shell: pwsh
         run: .\build.ps1
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" ".\installer.iss"'
 
       - name: Create SHA-256 checksum
         shell: pwsh
         run: |
-          $executable = 'dist\AI媒体标签工具.exe'
-          if (-not (Test-Path -LiteralPath $executable)) {
-            throw "Build output is missing: $executable"
+          $installer = 'dist_installer\AI媒体标签工具安装程序.exe'
+          if (-not (Test-Path -LiteralPath $installer)) {
+            throw "Build output is missing: $installer"
           }
-          $hash = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  AI媒体标签工具.exe" | Set-Content -LiteralPath 'dist\SHA256.txt' -Encoding ascii
+          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  AI媒体标签工具安装程序.exe" | Set-Content -LiteralPath 'dist_installer\SHA256.txt' -Encoding ascii
 
-      - name: Upload unsigned build artifact
-        id: upload
+      - name: Upload unsigned installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ai-media-tagger-windows-unsigned
+          name: ai-media-tagger-windows-installer-unsigned
           path: |
-            dist/AI媒体标签工具.exe
-            dist/SHA256.txt
+            dist_installer/AI媒体标签工具安装程序.exe
+            dist_installer/SHA256.txt
           if-no-files-found: error
-
-      # After SignPath Foundation approval, the artifact ID from the upload
-      # step will be submitted with signpath/github-action-submit-signing-request.
-      # Organization/project/policy identifiers are intentionally not guessed
-      # or committed before SignPath provisions the OSS subscription.

@@ -1,36 +1,21 @@
 # Third-party notices
 
-This repository contains or uses the following third-party projects. Their
-respective licenses continue to apply to their code, binaries and model files.
+AI 媒体标签工具包含或使用以下第三方软件和模型。各组件仍受其原许可证约束。
 
-## D-FINE
+| 组件 | 用途 | 许可证/来源 |
+| --- | --- | --- |
+| D-FINE | 人体与人体局部检测架构 | Apache License 2.0 — <https://github.com/Peterande/D-FINE> |
+| OpenCV YuNet / OpenCV Zoo | 人脸检测模型 | Apache License 2.0 — <https://github.com/opencv/opencv_zoo> |
+| ONNX Runtime | CPU 模型推理 | MIT License — <https://github.com/microsoft/onnxruntime> |
+| OpenCV | 图像处理和 YuNet 推理 | Apache License 2.0 — <https://github.com/opencv/opencv> |
+| Qt for Python / PySide6 | Windows 图形界面 | LGPLv3/GPLv3/commercial — <https://doc.qt.io/qtforpython-6/licenses.html> |
+| NumPy | 数值计算 | BSD-3-Clause — <https://github.com/numpy/numpy> |
+| Pillow | 图片读取与预处理 | HPND License — <https://github.com/python-pillow/Pillow> |
+| ExifTool | XMP 元数据读写 | Artistic License 1.0 or GPL-1.0-or-later — <https://exiftool.org/> |
+| PyInstaller | Windows 应用打包 | GPL-2.0-or-later with bootloader exception — <https://pyinstaller.org/> |
+| TorchVision EfficientNet | 本项目自训练分类模型所用网络架构 | BSD-3-Clause — <https://github.com/pytorch/vision> |
 
-- Project: https://github.com/Peterande/D-FINE
-- License: Apache License 2.0
-- Use: the `dfine_m_human_parts_trial.onnx` detector was fine-tuned from a
-  D-FINE-M COCO pretrained model.
+本项目发布的 D-FINE、EfficientNet 分类器权重由维护者针对本项目任务进行训练或微调。私人训练图片和冻结评测图片不包含在公开仓库或安装包中。
 
-## YuNet / OpenCV Zoo
-
-- Project: https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet
-- License: MIT for the YuNet model directory; see the upstream repository.
-- Use: `face_detection_yunet_2023mar.onnx` performs offline face detection.
-
-## OpenCV
-
-- Project: https://opencv.org/
-- License: Apache License 2.0 for current OpenCV releases.
-
-## ExifTool
-
-- Project: https://exiftool.org/
-- Copyright: Phil Harvey and contributors
-- License: Perl Artistic License or GNU GPL; the official package copied by
-  `prepare.ps1` includes the complete applicable license text.
-
-## Runtime libraries
-
-The application also depends on PySide6/Qt, ONNX Runtime, NumPy and Pillow.
-They are installed from their official Python packages and remain subject to
-their own license terms. Dependency versions are declared in `requirements.txt`.
+安装包内第三方运行库可能附带更完整的许可证文件；如本说明与第三方项目原许可证冲突，以原许可证为准。
 

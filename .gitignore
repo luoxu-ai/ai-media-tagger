@@ -7,6 +7,7 @@ __pycache__/
 
 build/
 dist/
+dist_installer/
 vendor/
 _exiftool/
 exiftool.zip
@@ -27,4 +28,3 @@ training_data/
 training_reports/
 qa/
 reports/
-

@@ -8,6 +8,10 @@ a = Analysis(
         ('.\\vendor\\exiftool_files', 'exiftool_files'),
         ('.\\assets\\app-icon.png', 'assets'),
         ('.\\assets\\app-icon.ico', 'assets'),
+        ('.\\LICENSE', 'licenses'),
+        ('.\\PRIVACY.md', 'licenses'),
+        ('.\\THIRD_PARTY_NOTICES.md', 'licenses'),
+        ('.\\CODE_SIGNING_POLICY.md', 'licenses'),
         ('.\\models\\dfine_m_human_parts_trial.onnx', 'models'),
         ('.\\models\\face_detection_yunet_2023mar.onnx', 'models'),
         ('.\\models\\presence_classifier_efficientnet_b0.onnx', 'models'),
@@ -59,8 +63,6 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
     name='AI媒体标签工具',
     debug=False,
@@ -75,6 +77,18 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    exclude_binaries=True,
+    contents_directory='runtime',
     icon=['assets\\app-icon.ico'],
     version='version_info.txt',
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='AI媒体标签工具',
 )
