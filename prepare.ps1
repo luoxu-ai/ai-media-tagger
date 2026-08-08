@@ -43,8 +43,13 @@ if (-not $ExtractedRoot.StartsWith($ProjectRoot, [StringComparison]::OrdinalIgno
 Remove-Item -LiteralPath $ExtractedRoot -Recurse -Force -ErrorAction SilentlyContinue
 Expand-Archive -LiteralPath $Zip -DestinationPath $Extracted -Force
 New-Item -ItemType Directory -Path "$ProjectDir\vendor" -Force | Out-Null
-$Exe = Get-ChildItem $Extracted -Recurse -Filter "exiftool(-k).exe" | Select-Object -First 1
+$Exe = Get-ChildItem $Extracted -Recurse -File |
+    Where-Object { $_.Name -in @("exiftool.exe", "exiftool(-k).exe") } |
+    Select-Object -First 1
 $Files = Get-ChildItem $Extracted -Recurse -Directory -Filter "exiftool_files" | Select-Object -First 1
+if (-not $Exe -or -not $Files) {
+    throw "Downloaded ExifTool archive is missing the expected executable or support folder."
+}
 Copy-Item -LiteralPath $Exe.FullName -Destination "$ProjectDir\vendor\exiftool.exe" -Force
 Copy-Item -LiteralPath $Files.FullName -Destination "$ProjectDir\vendor\exiftool_files" -Recurse -Force
 Write-Host "Dependencies are ready."
