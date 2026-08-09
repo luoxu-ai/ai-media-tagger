@@ -12,13 +12,13 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal, QSize, QUrl, QRect, QSettings, QEvent, QObject
-from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent, QMouseEvent, QKeyEvent, QIcon, QPainter, QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QTimer, Signal, QSize, QUrl, QRect, QSettings, QEvent, QObject, QLibraryInfo, QTranslator
+from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent, QMouseEvent, QKeyEvent, QIcon, QPainter, QKeySequence, QShortcut, QPalette
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
     QListWidget, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QTextEdit, QVBoxLayout, QWidget, QListWidgetItem, QStyle, QStyleOptionViewItem, QLayout,
+    QTextEdit, QVBoxLayout, QWidget, QListWidgetItem, QStyle, QStyleOptionViewItem, QLayout, QGridLayout,
     QStackedLayout, QStyledItemDelegate, QDialog, QButtonGroup,
 )
 
@@ -66,6 +66,30 @@ COMPANY_NAME = "深圳市艾润特贸易有限公司"
 GITHUB_PROJECT_URL = "https://github.com/luoxu-ai/ai-media-tagger"
 SETTINGS_ORGANIZATION = "CBT"
 SETTINGS_APPLICATION = "AIMediaTagTool"
+
+
+def show_information_message(parent: QWidget, title: str, text: str) -> None:
+    """Show a localized information dialog without a retained focus marker."""
+    dialog = QMessageBox(parent)
+    dialog.setIcon(QMessageBox.Icon.Information)
+    dialog.setWindowTitle(title)
+    dialog.setText(text)
+    confirm_button = dialog.addButton("确定", QMessageBox.ButtonRole.AcceptRole)
+    confirm_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    dialog.exec()
+
+
+def install_qt_chinese_translations(app: QApplication) -> bool:
+    """Localize standard Qt dialog buttons such as OK, Yes and No."""
+    translator = QTranslator(app)
+    loaded = translator.load(
+        "qtbase_zh_CN",
+        QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath),
+    )
+    if loaded:
+        app.installTranslator(translator)
+        app._qt_chinese_translator = translator
+    return loaded
 
 
 def automatic_update_checks_enabled() -> bool:
@@ -932,8 +956,8 @@ class FileStatusDelegate(QStyledItemDelegate):
         """Reserve enough height for two text lines at every DPI/font scale."""
         base = super().sizeHint(option, index)
         metrics = option.fontMetrics
-        two_lines = metrics.lineSpacing() * 2 + 24
-        return QSize(base.width(), max(64, base.height(), two_lines))
+        two_lines = metrics.lineSpacing() * 2 + 32
+        return QSize(base.width(), max(72, base.height(), two_lines))
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
         status = index.data(FILE_STATUS_TEXT_ROLE)
@@ -965,6 +989,13 @@ class FileStatusDelegate(QStyledItemDelegate):
             painter,
             content_option.widget,
         )
+        # Some Windows styles leave a one-line text clip region active after
+        # drawing the base item. Restore the painter before rendering our two
+        # lines so the path is not cut in half.
+        painter.restore()
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setClipRect(option.rect, Qt.ClipOperation.ReplaceClip)
 
         badge_font = content_option.font
         badge_font.setBold(True)
@@ -985,18 +1016,22 @@ class FileStatusDelegate(QStyledItemDelegate):
         if text_rect.width() > 20:
             painter.setFont(content_option.font)
             metrics = painter.fontMetrics()
-            name, _, parent = full_text.partition("\n")
-            line_height = metrics.height()
-            combined_height = line_height * 2 + 4
-            # QSS item padding can make SE_ItemViewItemText shorter than the
-            # two custom-painted lines, especially at 125%/150% Windows DPI.
-            # Centre against the full row and keep an explicit safe margin so
-            # glyph ascenders and descenders are never clipped.
-            safe_rect = option.rect.adjusted(0, 7, 0, -7)
-            top = safe_rect.center().y() - combined_height // 2
+            # QStyleOptionViewItem normalizes embedded newlines to U+2028 on
+            # some Qt/Windows combinations, so splitlines() is required here.
+            lines = full_text.splitlines()
+            name = lines[0] if lines else full_text
+            parent = " ".join(lines[1:])
+            line_spacing = metrics.lineSpacing()
+            combined_height = line_spacing * 2 + 4
+            top = option.rect.center().y() - combined_height // 2
+            # Give each line extra vertical padding. A rectangle that exactly
+            # matches the font height clips glyphs on some Windows DPI/font
+            # combinations, while these padded single-line rectangles keep the
+            # filename and path visually separate.
+            line_height = line_spacing + 6
             name_rect = QRect(text_rect.left(), top, text_rect.width(), line_height)
             parent_rect = QRect(
-                text_rect.left(), top + line_height + 4, text_rect.width(), line_height
+                text_rect.left(), top + line_spacing + 4, text_rect.width(), line_height
             )
             selected = bool(
                 content_option.state & QStyle.StateFlag.State_Selected
@@ -1007,17 +1042,30 @@ class FileStatusDelegate(QStyledItemDelegate):
             else:
                 name_color = "#0867df" if selected else "#253247"
                 parent_color = "#0867df" if selected else "#5f6f86"
-            painter.setPen(QColor(name_color))
-            painter.drawText(
+            text_palette = QPalette(content_option.palette)
+            text_palette.setColor(QPalette.ColorRole.Text, QColor(name_color))
+            style.drawItemText(
+                painter,
                 name_rect,
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                metrics.elidedText(name, Qt.TextElideMode.ElideMiddle, name_rect.width()),
+                Qt.AlignmentFlag.AlignLeft
+                | Qt.AlignmentFlag.AlignVCenter
+                | Qt.TextFlag.TextSingleLine,
+                text_palette,
+                True,
+                metrics.elidedText(name, Qt.TextElideMode.ElideMiddle, text_rect.width()),
+                QPalette.ColorRole.Text,
             )
-            painter.setPen(QColor(parent_color))
-            painter.drawText(
+            text_palette.setColor(QPalette.ColorRole.Text, QColor(parent_color))
+            style.drawItemText(
+                painter,
                 parent_rect,
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                metrics.elidedText(parent, Qt.TextElideMode.ElideMiddle, parent_rect.width()),
+                Qt.AlignmentFlag.AlignLeft
+                | Qt.AlignmentFlag.AlignVCenter
+                | Qt.TextFlag.TextSingleLine,
+                text_palette,
+                True,
+                metrics.elidedText(parent, Qt.TextElideMode.ElideMiddle, text_rect.width()),
+                QPalette.ColorRole.Text,
             )
 
         painter.setFont(badge_font)
@@ -1034,11 +1082,13 @@ class SettingsDialog(QDialog):
         self, on_check, on_show_log, on_export_log,
         parent: QWidget | None = None,
         on_cache_info=None, on_clear_cache=None, on_diagnostics=None,
+        on_open_log_folder=None,
     ):
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setModal(True)
-        self.setFixedWidth(460)
+        self.setMinimumWidth(460)
+        self.resize(500, 390)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 16, 22, 16)
         layout.setSpacing(12)
@@ -1100,6 +1150,12 @@ class SettingsDialog(QDialog):
         export_log.setObjectName("outlineAction")
         export_log.clicked.connect(on_export_log)
         log_buttons.addWidget(export_log)
+        open_logs = QPushButton("打开日志文件夹")
+        open_logs.setObjectName("outlineAction")
+        open_logs.setEnabled(on_open_log_folder is not None)
+        if on_open_log_folder is not None:
+            open_logs.clicked.connect(on_open_log_folder)
+        log_buttons.addWidget(open_logs)
         log_buttons.addStretch()
         layout.addLayout(log_buttons)
         maintenance_heading = QLabel("存储与诊断")
@@ -1133,7 +1189,7 @@ class SettingsDialog(QDialog):
         close_button.clicked.connect(self.accept)
         buttons.addWidget(close_button)
         layout.addLayout(buttons)
-        layout.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
 
 class AboutDialog(QDialog):
@@ -1141,7 +1197,8 @@ class AboutDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("关于我们")
         self.setModal(True)
-        self.setFixedSize(500, 370)
+        self.setMinimumSize(500, 370)
+        self.resize(540, 410)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 22)
         layout.setSpacing(11)
@@ -1338,7 +1395,6 @@ class MainWindow(QMainWindow):
         self.files: list[Path] = []
         self.tagged_file_keys: set[str] = set()
         self.file_statuses: dict[str, tuple[str, str]] = {}
-        self.status_filter = "all"
         self._list_items_by_key: dict[str, QListWidgetItem] = {}
         self._list_indexes_by_key: dict[str, int] = {}
         self._checked_count = 0
@@ -1394,6 +1450,11 @@ class MainWindow(QMainWindow):
         # native window exists prevents Windows from intermittently retaining
         # the launcher's blank taskbar icon.
         QTimer.singleShot(0, self._apply_windows_taskbar_icon)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "actionbar"):
+            self._layout_action_buttons(event.size().width() < 1100)
 
     def _install_keyboard_shortcuts(self) -> None:
         self._shortcuts: list[QShortcut] = []
@@ -1587,39 +1648,16 @@ class MainWindow(QMainWindow):
         file_header = QWidget(); file_header.setObjectName("fileHeader")
         file_header_layout = QHBoxLayout(file_header); file_header_layout.setContentsMargins(14, 10, 14, 10)
         self.count = QLabel("已选择：0 / 0 个文件"); self.count.setObjectName("count"); file_header_layout.addWidget(self.count)
-        file_header_layout.addSpacing(18)
-        self.status_filter_group = QButtonGroup(self)
-        self.status_filter_group.setExclusive(True)
-        self.status_filter_buttons: dict[str, QPushButton] = {}
-        filter_options = (
-            ("全部", "all"),
-            ("已导出", "exported"),
-            ("未检测", "skipped"),
-            ("失败", "failure"),
-        )
-        for index, (label, value) in enumerate(filter_options):
-            option = QPushButton(label)
-            option.setObjectName("themeOption")
-            option.setProperty(
-                "segment",
-                "first" if index == 0 else "last" if index == len(filter_options) - 1 else "middle",
-            )
-            option.setCheckable(True)
-            option.setChecked(value == self.status_filter)
-            option.setMinimumWidth(72 if value != "exported" else 86)
-            option.setVisible(False)
-            option.clicked.connect(
-                lambda checked=False, selected=value: self._set_status_filter(selected)
-                if checked else None
-            )
-            self.status_filter_group.addButton(option)
-            self.status_filter_buttons[value] = option
-            file_header_layout.addWidget(option)
         file_header_layout.addStretch()
         self.select_all_button = QPushButton("全选"); self.select_all_button.setObjectName("smallAction"); self.select_all_button.clicked.connect(self.check_all)
         self.select_none_button = QPushButton("取消全选"); self.select_none_button.setObjectName("smallAction"); self.select_none_button.clicked.connect(self.uncheck_all)
         self.clear_button = QPushButton("清空列表"); self.clear_button.setObjectName("smallAction"); self.clear_button.clicked.connect(self.clear_files)
         for button in (self.select_all_button, self.select_none_button, self.clear_button):
+            # Remove the persistent mouse-click focus ring after activation,
+            # while keeping the button reachable with Tab for keyboard users.
+            button.clicked.connect(
+                lambda checked=False, target=button: target.clearFocus()
+            )
             file_header_layout.addWidget(button)
         files_layout.addWidget(file_header)
 
@@ -1630,7 +1668,7 @@ class MainWindow(QMainWindow):
         empty = QFrame(); empty.setObjectName("dropZone")
         empty_layout = QVBoxLayout(empty); empty_layout.setContentsMargins(20, 28, 20, 28); empty_layout.setSpacing(7); empty_layout.setAlignment(Qt.AlignCenter)
         empty_title = QLabel("将文件或文件夹拖到此处"); empty_title.setObjectName("dropTitle"); empty_title.setAlignment(Qt.AlignCenter)
-        empty_subtitle = QLabel("支持递归扫描；自动忽略其他格式和已有标签的文件")
+        empty_subtitle = QLabel("支持递归扫描；自动忽略其他格式，已有标签文件保持未勾选")
         empty_subtitle.setObjectName("muted"); empty_subtitle.setAlignment(Qt.AlignCenter)
         empty_layout.addWidget(empty_title); empty_layout.addWidget(empty_subtitle); empty_layout.addSpacing(8)
         add_buttons = QHBoxLayout(); add_buttons.addStretch()
@@ -1667,39 +1705,62 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar(); self.progress.setRange(0, 1); self.progress.setValue(0); self.progress.setTextVisible(False)
         action_layout.addWidget(self.progress)
 
-        actionbar = QHBoxLayout()
+        self.actionbar = QGridLayout()
+        self.actionbar.setHorizontalSpacing(10)
+        self.actionbar.setVerticalSpacing(8)
         self.settings_button = QPushButton("⚙ 设置")
         self.settings_button.setObjectName("outlineAction")
         self.settings_button.setFixedSize(110, 42)
         self.settings_button.clicked.connect(self.show_settings_dialog)
-        actionbar.addWidget(self.settings_button)
         self.about_button = QPushButton("关于我们")
         self.about_button.setObjectName("outlineAction")
         self.about_button.setFixedSize(110, 42)
         self.about_button.clicked.connect(self.show_about_dialog)
-        actionbar.addWidget(self.about_button)
-        actionbar.addStretch()
         self.stop_button = QPushButton("安全停止")
         self.stop_button.setObjectName("stopAction")
         self.stop_button.setFixedSize(110, 42)
         self.stop_button.clicked.connect(self.request_stop)
-        actionbar.addWidget(self.stop_button)
         self.cleanup_button = QPushButton("撤销标签")
         self.cleanup_button.setObjectName("outlineAction")
         self.cleanup_button.setFixedSize(110, 42)
         self.cleanup_button.clicked.connect(self.start_cleanup)
-        actionbar.addWidget(self.cleanup_button)
         self.start_button = QPushButton("导出已勾选（0）"); self.start_button.setObjectName("secondaryAction"); self.start_button.setFixedSize(205, 42); self.start_button.clicked.connect(self.start)
-        actionbar.addWidget(self.start_button)
         self.smart_button = QPushButton("智能识别并导出")
         self.smart_button.setObjectName("smartPrimary"); self.smart_button.setFixedSize(230, 46)
         self.smart_button.clicked.connect(self.start_smart)
-        actionbar.addWidget(self.smart_button)
-        action_layout.addLayout(actionbar)
+        self._actionbar_compact: bool | None = None
+        self._layout_action_buttons(self.width() < 1100)
+        action_layout.addLayout(self.actionbar)
         layout.addWidget(action_panel)
 
         outer.addWidget(card, 1)
         self._update_action_states()
+
+    def _layout_action_buttons(self, compact: bool) -> None:
+        """Keep every action visible when the main window becomes narrow."""
+        if self._actionbar_compact is compact:
+            return
+        self._actionbar_compact = compact
+        while self.actionbar.count():
+            self.actionbar.takeAt(0)
+        for column in range(7):
+            self.actionbar.setColumnStretch(column, 0)
+        if compact:
+            self.actionbar.addWidget(self.settings_button, 0, 0)
+            self.actionbar.addWidget(self.about_button, 0, 1)
+            self.actionbar.setColumnStretch(2, 1)
+            self.actionbar.addWidget(self.stop_button, 0, 3)
+            self.actionbar.addWidget(self.cleanup_button, 0, 4)
+            self.actionbar.addWidget(self.start_button, 1, 3)
+            self.actionbar.addWidget(self.smart_button, 1, 4)
+        else:
+            self.actionbar.addWidget(self.settings_button, 0, 0)
+            self.actionbar.addWidget(self.about_button, 0, 1)
+            self.actionbar.setColumnStretch(2, 1)
+            self.actionbar.addWidget(self.stop_button, 0, 3)
+            self.actionbar.addWidget(self.cleanup_button, 0, 4)
+            self.actionbar.addWidget(self.start_button, 0, 5)
+            self.actionbar.addWidget(self.smart_button, 0, 6)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if not self.running and not self.importing and event.mimeData().hasUrls():
@@ -1782,11 +1843,22 @@ class MainWindow(QMainWindow):
             on_cache_info=self.detection_cache_summary,
             on_clear_cache=self.clear_detection_cache,
             on_diagnostics=self.show_system_diagnostics,
+            on_open_log_folder=self.open_log_folder,
         )
         dialog.exec()
 
     def show_about_dialog(self) -> None:
         AboutDialog(self, on_diagnostics=self.show_system_diagnostics).exec()
+
+    def open_log_folder(self) -> None:
+        folder = persistent_log_directory()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(self, APP_NAME, f"无法创建日志文件夹：{exc}")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))):
+            QMessageBox.warning(self, APP_NAME, "无法打开日志文件夹。")
 
     def detection_cache_summary(self) -> str:
         with self._detector_lock:
@@ -2068,8 +2140,6 @@ class MainWindow(QMainWindow):
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
             self.progress_text.setText("0%")
-            self.status_filter = "all"
-            self.status_filter_buttons["all"].setChecked(True)
             self.refresh(set())
 
     def remove_selected_files(self):
@@ -2092,52 +2162,6 @@ class MainWindow(QMainWindow):
             self.file_statuses.pop(key, None)
         self.status.setText(f"已从列表移除 {len(valid_rows)} 个文件；原文件未删除")
 
-    def _set_status_filter(self, value: str) -> None:
-        self.status_filter = value if value in {"all", "exported", "skipped", "failure"} else "all"
-        self._apply_status_filter()
-
-    def _update_status_filter_labels(self) -> None:
-        counts = {"exported": 0, "skipped": 0, "failure": 0}
-        for status in self.file_statuses.values():
-            text, kind = status
-            if text in {"已导出", "已有标签"}:
-                counts["exported"] += 1
-            if text == "未检测到人物":
-                counts["skipped"] += 1
-            if kind == "failure":
-                counts["failure"] += 1
-        labels = {
-            "all": f"全部 {len(self.files)}",
-            "exported": f"已导出 {counts['exported']}",
-            "skipped": f"未检测 {counts['skipped']}",
-            "failure": f"失败 {counts['failure']}",
-        }
-        for key, button in self.status_filter_buttons.items():
-            button.setText(labels[key])
-            button.setMinimumWidth(72 if key != "exported" else 86)
-
-    def _status_matches_filter(self, status: tuple[str, str] | None) -> bool:
-        if self.status_filter == "all":
-            return True
-        if status is None:
-            return False
-        text, kind = status
-        if self.status_filter == "exported":
-            return text in {"已导出", "已有标签"}
-        if self.status_filter == "skipped":
-            return text == "未检测到人物"
-        return kind == "failure"
-
-    def _apply_status_filter(self) -> None:
-        for index, path in enumerate(self.files):
-            item = self.list.item(index)
-            if item is not None:
-                item.setHidden(
-                    not self._status_matches_filter(
-                        self.file_statuses.get(str(path).casefold())
-                    )
-                )
-
     def refresh(self, checked_keys: set[str] | None = None):
         if checked_keys is None:
             checked_keys = {str(path).casefold() for path in self.files}
@@ -2150,7 +2174,7 @@ class MainWindow(QMainWindow):
             for index, path in enumerate(self.files):
                 key = str(path).casefold()
                 item = QListWidgetItem(f"{path.name}\n{path.parent}")
-                row_height = max(64, self.list.fontMetrics().lineSpacing() * 2 + 24)
+                row_height = max(72, self.list.fontMetrics().lineSpacing() * 2 + 32)
                 item.setSizeHint(QSize(0, row_height))
                 item.setToolTip(str(path))
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
@@ -2162,6 +2186,15 @@ class MainWindow(QMainWindow):
                 if status is not None:
                     item.setData(FILE_STATUS_TEXT_ROLE, status[0])
                     item.setData(FILE_STATUS_KIND_ROLE, status[1])
+                accessible_status = status[0] if status is not None else "未处理"
+                item.setData(
+                    Qt.ItemDataRole.AccessibleTextRole,
+                    f"{path.name}，{accessible_status}",
+                )
+                item.setData(
+                    Qt.ItemDataRole.AccessibleDescriptionRole,
+                    f"路径：{path.parent}",
+                )
                 self.list.addItem(item)
                 self._list_items_by_key[key] = item
                 self._list_indexes_by_key[key] = index
@@ -2170,10 +2203,6 @@ class MainWindow(QMainWindow):
             self.list.blockSignals(False)
             self.list.setUpdatesEnabled(True)
         self.list_stack.setCurrentIndex(1 if self.files else 0)
-        for button in self.status_filter_buttons.values():
-            button.setVisible(bool(self.files))
-        self._update_status_filter_labels()
-        self._apply_status_filter()
         self.update_checked_count()
         self.status.setText("文件已就绪" if self.files else "等待添加文件")
         self._schedule_session_save()
@@ -2181,16 +2210,19 @@ class MainWindow(QMainWindow):
     def _set_file_status(self, path: Path, text: str, kind: str) -> None:
         key = str(path).casefold()
         self.file_statuses[key] = (text, kind)
-        self._update_status_filter_labels()
         item = self._list_items_by_key.get(key)
         if item is not None:
             item.setData(FILE_STATUS_TEXT_ROLE, text)
             item.setData(FILE_STATUS_KIND_ROLE, kind)
+            path = self.files[self._list_indexes_by_key[key]]
+            item.setData(
+                Qt.ItemDataRole.AccessibleTextRole,
+                f"{path.name}，{text}",
+            )
             if kind == "processing":
                 # Do not recenter on every file. Advance the viewport only
                 # when the active row would otherwise fall below its bottom.
                 self.list.scrollToItem(item, QAbstractItemView.EnsureVisible)
-        self._apply_status_filter()
         self._schedule_session_save()
 
     def _set_file_checked(self, path: Path, checked: bool) -> None:
@@ -2230,6 +2262,14 @@ class MainWindow(QMainWindow):
         self.tagged_file_keys.discard(old_key)
         item.setText(f"{new_path.name}\n{new_path.parent}")
         item.setToolTip(str(new_path))
+        item.setData(
+            Qt.ItemDataRole.AccessibleTextRole,
+            f"{new_path.name}，{status[0] if status is not None else '未处理'}",
+        )
+        item.setData(
+            Qt.ItemDataRole.AccessibleDescriptionRole,
+            f"路径：{new_path.parent}",
+        )
         self._schedule_session_save()
         return new_path
 
@@ -2863,7 +2903,7 @@ class MainWindow(QMainWindow):
                     )
                     self.update_badge.show()
                 elif event[0] == "update_current":
-                    QMessageBox.information(
+                    show_information_message(
                         self, APP_NAME, f"当前已是最新版本 v{APP_VERSION}。"
                     )
                 elif event[0] == "update_check_error":
@@ -3242,6 +3282,7 @@ def main():
         return
     configure_windows_app_identity()
     app = QApplication(sys.argv)
+    install_qt_chinese_translations(app)
     install_windows_title_bar_theme_filter(app)
     icon_path = bundled_path("assets/app-icon.ico")
     if not icon_path.is_file():

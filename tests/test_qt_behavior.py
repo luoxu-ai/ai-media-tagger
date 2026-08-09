@@ -194,7 +194,12 @@ class QtBehaviorTests(unittest.TestCase):
             dialog.close()
 
     def test_settings_offer_system_light_and_dark_themes(self):
-        dialog = SettingsDialog(lambda *_: None, lambda: None, lambda: None)
+        dialog = SettingsDialog(
+            lambda *_: None,
+            lambda: None,
+            lambda: None,
+            on_open_log_folder=lambda: None,
+        )
         try:
             options = [
                 button.property("themeValue")
@@ -203,6 +208,9 @@ class QtBehaviorTests(unittest.TestCase):
             self.assertEqual(options, ["light", "dark", "system"])
             self.assertEqual(dialog.automatic_check.text(), "自动检查更新")
             self.assertEqual(dialog.check_update_button.text(), "立即检查更新")
+            button_texts = [button.text() for button in dialog.findChildren(qt_app.QPushButton)]
+            self.assertIn("打开日志文件夹", button_texts)
+            self.assertGreater(dialog.maximumWidth(), dialog.minimumWidth())
         finally:
             dialog.close()
 
@@ -385,6 +393,14 @@ class QtBehaviorTests(unittest.TestCase):
                 item = window.list.item(0)
                 self.assertEqual(item.text(), f"{source.name}\n{source.parent}")
                 self.assertEqual(item.toolTip(), str(source))
+                self.assertEqual(
+                    item.data(Qt.ItemDataRole.AccessibleTextRole),
+                    f"{source.name}，未处理",
+                )
+                self.assertEqual(
+                    item.data(Qt.ItemDataRole.AccessibleDescriptionRole),
+                    f"路径：{source.parent}",
+                )
                 self.assertEqual(window.list_stack.currentIndex(), 1)
                 self.assertTrue(window.start_button.isEnabled())
                 self.assertTrue(window.smart_button.isEnabled())
@@ -416,9 +432,41 @@ class QtBehaviorTests(unittest.TestCase):
             window.files = [source]
             window.refresh({str(source).casefold()})
             item = window.list.item(0)
-            required = window.list.fontMetrics().lineSpacing() * 2 + 24
-            self.assertGreaterEqual(item.sizeHint().height(), 64)
+            required = window.list.fontMetrics().lineSpacing() * 2 + 32
+            self.assertGreaterEqual(item.sizeHint().height(), 72)
             self.assertGreaterEqual(item.sizeHint().height(), required)
+        finally:
+            window.close()
+
+    def test_narrow_window_wraps_primary_actions_to_a_second_row(self):
+        window = MainWindow()
+        try:
+            window.show()
+            window.resize(900, 650)
+            QApplication.processEvents()
+            start_index = window.actionbar.indexOf(window.start_button)
+            smart_index = window.actionbar.indexOf(window.smart_button)
+            self.assertEqual(window.actionbar.getItemPosition(start_index)[0], 1)
+            self.assertEqual(window.actionbar.getItemPosition(smart_index)[0], 1)
+
+            window.resize(1200, 820)
+            QApplication.processEvents()
+            start_index = window.actionbar.indexOf(window.start_button)
+            smart_index = window.actionbar.indexOf(window.smart_button)
+            self.assertEqual(window.actionbar.getItemPosition(start_index)[0], 0)
+            self.assertEqual(window.actionbar.getItemPosition(smart_index)[0], 0)
+        finally:
+            window.close()
+
+    def test_file_header_actions_remain_keyboard_focusable(self):
+        window = MainWindow()
+        try:
+            for button in (
+                window.select_all_button,
+                window.select_none_button,
+                window.clear_button,
+            ):
+                self.assertNotEqual(button.focusPolicy(), Qt.FocusPolicy.NoFocus)
         finally:
             window.close()
 
@@ -588,7 +636,7 @@ class QtBehaviorTests(unittest.TestCase):
             window.close()
 
     def test_file_list_renders_2000_unicode_paths_within_reasonable_time(self):
-        root = Path(r"G:\AI训练\测试目录_中文")
+        root = Path(r"C:\测试样本\测试目录_中文")
         paths = [root / f"商品图_{index:04d}.jpg" for index in range(2000)]
         window = MainWindow()
         try:
@@ -764,7 +812,7 @@ class QtBehaviorTests(unittest.TestCase):
             finally:
                 window.close()
 
-    def test_result_filters_show_only_matching_rows(self):
+    def test_file_status_updates_keep_every_row_visible(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             paths = [root / f"sample_{index}.jpg" for index in range(4)]
@@ -777,28 +825,8 @@ class QtBehaviorTests(unittest.TestCase):
                 window._set_file_status(paths[0], "已导出", "success")
                 window._set_file_status(paths[1], "未检测到人物", "skipped")
                 window._set_file_status(paths[2], "处理失败", "failure")
-                self.assertEqual(window.status_filter_buttons["all"].text(), "全部 4")
-                self.assertEqual(window.status_filter_buttons["exported"].text(), "已导出 1")
-                self.assertEqual(window.status_filter_buttons["skipped"].text(), "未检测 1")
-                self.assertEqual(window.status_filter_buttons["failure"].text(), "失败 1")
-
-                window._set_status_filter("exported")
-                self.assertEqual(
-                    [window.list.item(index).isHidden() for index in range(4)],
-                    [False, True, True, True],
-                )
-                window._set_status_filter("skipped")
-                self.assertEqual(
-                    [window.list.item(index).isHidden() for index in range(4)],
-                    [True, False, True, True],
-                )
-                window._set_status_filter("failure")
-                self.assertEqual(
-                    [window.list.item(index).isHidden() for index in range(4)],
-                    [True, True, False, True],
-                )
-                window._set_status_filter("all")
                 self.assertFalse(any(window.list.item(index).isHidden() for index in range(4)))
+                self.assertFalse(hasattr(window, "status_filter_buttons"))
             finally:
                 window.close()
 
