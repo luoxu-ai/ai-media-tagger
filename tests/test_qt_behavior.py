@@ -26,6 +26,7 @@ from qt_app import (
     FILE_STATUS_TEXT_ROLE,
     WINDOWS_APP_USER_MODEL_ID,
     MainWindow,
+    media_file_icon,
     SingleInstanceController,
     configure_windows_app_identity,
     single_instance_server_name,
@@ -867,10 +868,12 @@ class QtBehaviorTests(unittest.TestCase):
 
                 image_item = window.list.item(0)
                 video_item = window.list.item(1)
-                self.assertFalse(image_item.icon().isNull())
-                self.assertFalse(video_item.icon().isNull())
+                image_icon = media_file_icon(image)
+                video_icon = media_file_icon(video)
+                self.assertFalse(image_icon.isNull())
+                self.assertFalse(video_icon.isNull())
                 self.assertNotEqual(
-                    image_item.icon().cacheKey(), video_item.icon().cacheKey()
+                    image_icon.cacheKey(), video_icon.cacheKey()
                 )
                 self.assertEqual(image_item.data(FILE_MEDIA_KIND_ROLE), "image")
                 self.assertEqual(video_item.data(FILE_MEDIA_KIND_ROLE), "video")

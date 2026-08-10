@@ -962,9 +962,6 @@ class FileStatusDelegate(QStyledItemDelegate):
 
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
         status = index.data(FILE_STATUS_TEXT_ROLE)
-        if not status:
-            super().paint(painter, option, index)
-            return
         kind = index.data(FILE_STATUS_KIND_ROLE) or "pending"
         app = QApplication.instance()
         dark = app is not None and bool(app.property("darkTheme"))
@@ -998,22 +995,32 @@ class FileStatusDelegate(QStyledItemDelegate):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setClipRect(option.rect, Qt.ClipOperation.ReplaceClip)
 
+        badge = None
         badge_font = content_option.font
-        badge_font.setBold(True)
-        badge_font.setPointSizeF(max(9.0, badge_font.pointSizeF() - 0.5))
-        painter.setFont(badge_font)
-        width = max(
-            76,
-            min(148, painter.fontMetrics().horizontalAdvance(str(status)) + 24),
-        )
-        badge = self._badge_rect(option, width)
+        if status:
+            badge_font.setBold(True)
+            badge_font.setPointSizeF(max(9.0, badge_font.pointSizeF() - 0.5))
+            painter.setFont(badge_font)
+            width = max(
+                76,
+                min(148, painter.fontMetrics().horizontalAdvance(str(status)) + 24),
+            )
+            badge = self._badge_rect(option, width)
 
         text_rect = style.subElementRect(
             QStyle.SubElement.SE_ItemViewItemText,
             content_option,
             content_option.widget,
         )
-        text_rect.setRight(badge.left() - 12)
+        media_kind = index.data(FILE_MEDIA_KIND_ROLE) or "image"
+        icon_rect = QRect(
+            text_rect.left(), option.rect.center().y() - 11, 22, 22
+        )
+        media_kind_icon(str(media_kind)).paint(painter, icon_rect)
+        text_rect.setLeft(icon_rect.right() + 8)
+        text_rect.setRight(
+            badge.left() - 12 if badge is not None else option.rect.right() - 18
+        )
         if text_rect.width() > 20:
             painter.setFont(content_option.font)
             metrics = painter.fontMetrics()
@@ -1069,18 +1076,24 @@ class FileStatusDelegate(QStyledItemDelegate):
                 QPalette.ColorRole.Text,
             )
 
-        painter.setFont(badge_font)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(background))
-        painter.drawRoundedRect(badge, 9, 9)
-        painter.setPen(QColor(foreground))
-        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, str(status))
+        if badge is not None:
+            painter.setFont(badge_font)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(background))
+            painter.drawRoundedRect(badge, 9, 9)
+            painter.setPen(QColor(foreground))
+            painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, str(status))
         painter.restore()
 
 
 def media_file_icon(path: Path) -> QIcon:
     """Return a compact, unmistakable image/video icon for a file row."""
     kind = "video" if path.suffix.casefold() == ".mp4" else "image"
+    return media_kind_icon(kind)
+
+
+def media_kind_icon(kind: str) -> QIcon:
+    """Return a cached icon; rows paint it lazily through the delegate."""
     cached = _MEDIA_FILE_ICONS.get(kind)
     if cached is not None:
         return cached
@@ -2223,7 +2236,6 @@ class MainWindow(QMainWindow):
             for index, path in enumerate(self.files):
                 key = str(path).casefold()
                 item = QListWidgetItem(f"{path.name}\n{path.parent}")
-                item.setIcon(media_file_icon(path))
                 item.setData(
                     FILE_MEDIA_KIND_ROLE,
                     "video" if path.suffix.casefold() == ".mp4" else "image",
@@ -2315,7 +2327,6 @@ class MainWindow(QMainWindow):
             self.file_statuses[new_key] = status
         self.tagged_file_keys.discard(old_key)
         item.setText(f"{new_path.name}\n{new_path.parent}")
-        item.setIcon(media_file_icon(new_path))
         item.setData(
             FILE_MEDIA_KIND_ROLE,
             "video" if new_path.suffix.casefold() == ".mp4" else "image",
