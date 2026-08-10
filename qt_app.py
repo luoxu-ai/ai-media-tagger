@@ -12,8 +12,8 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal, QSize, QUrl, QRect, QSettings, QEvent, QObject, QLibraryInfo, QTranslator
-from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent, QMouseEvent, QKeyEvent, QIcon, QPainter, QKeySequence, QShortcut, QPalette
+from PySide6.QtCore import Qt, QTimer, Signal, QSize, QUrl, QRect, QPoint, QSettings, QEvent, QObject, QLibraryInfo, QTranslator
+from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent, QMouseEvent, QKeyEvent, QIcon, QPainter, QPixmap, QPolygon, QKeySequence, QShortcut, QPalette
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
@@ -60,6 +60,7 @@ FEISHU_CONTACT_URL = (
 
 FILE_STATUS_TEXT_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 FILE_STATUS_KIND_ROLE = int(Qt.ItemDataRole.UserRole) + 2
+FILE_MEDIA_KIND_ROLE = int(Qt.ItemDataRole.UserRole) + 3
 WINDOWS_APP_USER_MODEL_ID = "CBT.AIMediaTagTool"
 DEVELOPER_NAME = "Xu Luo"
 COMPANY_NAME = "深圳市艾润特贸易有限公司"
@@ -1077,6 +1078,45 @@ class FileStatusDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+def media_file_icon(path: Path) -> QIcon:
+    """Return a compact, unmistakable image/video icon for a file row."""
+    kind = "video" if path.suffix.casefold() == ".mp4" else "image"
+    cached = _MEDIA_FILE_ICONS.get(kind)
+    if cached is not None:
+        return cached
+
+    pixmap = QPixmap(32, 32)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#1478f2" if kind == "video" else "#24a86b"))
+    painter.drawRoundedRect(QRect(3, 3, 26, 26), 6, 6)
+    painter.setBrush(QColor("#ffffff"))
+    if kind == "video":
+        painter.drawPolygon(QPolygon([QPoint(12, 9), QPoint(24, 16), QPoint(12, 23)]))
+    else:
+        painter.drawEllipse(QRect(8, 8, 5, 5))
+        painter.drawPolygon(
+            QPolygon(
+                [
+                    QPoint(7, 24),
+                    QPoint(13, 16),
+                    QPoint(17, 20),
+                    QPoint(21, 14),
+                    QPoint(26, 24),
+                ]
+            )
+        )
+    painter.end()
+    icon = QIcon(pixmap)
+    _MEDIA_FILE_ICONS[kind] = icon
+    return icon
+
+
+_MEDIA_FILE_ICONS: dict[str, QIcon] = {}
+
+
 class SettingsDialog(QDialog):
     def __init__(
         self, on_check, on_show_log, on_export_log,
@@ -1439,7 +1479,9 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(900, self._start_environment_check)
         self._startup_update_result = None
         if getattr(sys, "frozen", False):
-            self._startup_update_result = consume_update_startup_result(APP_VERSION)
+            self._startup_update_result = consume_update_startup_result(
+                APP_VERSION, clear=False
+            )
             if self._startup_update_result is not None:
                 QTimer.singleShot(1400, self._show_startup_update_result)
 
@@ -1476,17 +1518,23 @@ class MainWindow(QMainWindow):
         if result is None:
             return
         status, version = result
-        if status == "completed":
-            QMessageBox.information(
-                self, "更新完成", f"软件已成功更新至 v{version}。"
-            )
-        else:
-            QMessageBox.warning(
-                self,
-                "更新未完成",
-                f"新版安装没有完成，当前仍可继续使用 v{version}。\n"
-                "你可以稍后重新检查更新。",
-            )
+        try:
+            if status == "completed":
+                QMessageBox.information(
+                    self, "更新完成", f"软件已成功更新至 v{version}。"
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "更新未完成",
+                    f"新版安装没有完成，当前仍可继续使用 v{version}。\n"
+                    "你可以稍后重新检查更新。",
+                )
+        finally:
+            # Keep the marker until the message has genuinely been displayed.
+            # This prevents a short-lived installer-launched process from
+            # consuming the only completion notification.
+            clear_update_install_marker()
 
     def _apply_windows_taskbar_icon(self) -> None:
         if os.name != "nt" or self._icon_path is None:
@@ -1684,6 +1732,7 @@ class MainWindow(QMainWindow):
             add_buttons.addWidget(button)
         add_buttons.addStretch(); empty_layout.addLayout(add_buttons)
         self.list = CheckableListWidget(); self.list.setObjectName("fileList"); self.list.setAlternatingRowColors(False); self.list.setTextElideMode(Qt.ElideMiddle)
+        self.list.setIconSize(QSize(22, 22))
         self.list.setItemDelegate(FileStatusDelegate(self.list))
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.list.setSelectionMode(QAbstractItemView.MultiSelection)
@@ -2174,6 +2223,11 @@ class MainWindow(QMainWindow):
             for index, path in enumerate(self.files):
                 key = str(path).casefold()
                 item = QListWidgetItem(f"{path.name}\n{path.parent}")
+                item.setIcon(media_file_icon(path))
+                item.setData(
+                    FILE_MEDIA_KIND_ROLE,
+                    "video" if path.suffix.casefold() == ".mp4" else "image",
+                )
                 row_height = max(72, self.list.fontMetrics().lineSpacing() * 2 + 32)
                 item.setSizeHint(QSize(0, row_height))
                 item.setToolTip(str(path))
@@ -2261,6 +2315,11 @@ class MainWindow(QMainWindow):
             self.file_statuses[new_key] = status
         self.tagged_file_keys.discard(old_key)
         item.setText(f"{new_path.name}\n{new_path.parent}")
+        item.setIcon(media_file_icon(new_path))
+        item.setData(
+            FILE_MEDIA_KIND_ROLE,
+            "video" if new_path.suffix.casefold() == ".mp4" else "image",
+        )
         item.setToolTip(str(new_path))
         item.setData(
             Qt.ItemDataRole.AccessibleTextRole,

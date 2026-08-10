@@ -32,6 +32,7 @@ TRUSTED_RELEASE_HOSTS = {
 }
 USER_AGENT = "AI-Media-Tagger-Updater"
 AUTOMATIC_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
+UPDATE_INSTALL_GRACE_SECONDS = 15 * 60
 
 
 class UpdateError(RuntimeError):
@@ -180,24 +181,43 @@ def clear_update_install_marker() -> None:
         pass
 
 
-def consume_update_startup_result(current_version: str) -> tuple[str, str] | None:
-    """Return a one-shot completed/failed status after an installer restart."""
+def consume_update_startup_result(
+    current_version: str,
+    *,
+    clear: bool = True,
+    now: float | None = None,
+) -> tuple[str, str] | None:
+    """Return the completed/failed status after an installer restart.
+
+    ``clear=False`` lets the UI keep the marker until the notification has
+    actually been shown.  A newly created marker is also kept while the
+    installer may still be replacing files, so a transient old process cannot
+    incorrectly consume the result before the new version starts.
+    """
     marker = update_install_marker_path()
     try:
         payload = json.loads(marker.read_text(encoding="utf-8"))
         target = str(payload.get("target_version") or "").strip()
         previous = str(payload.get("previous_version") or "").strip()
+        started_at = float(payload.get("started_at") or 0.0)
     except FileNotFoundError:
         return None
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, TypeError, AttributeError):
         clear_update_install_marker()
         return None
-    clear_update_install_marker()
     if not target:
+        clear_update_install_marker()
         return None
-    if not is_newer_version(target, current_version):
-        return "completed", current_version
-    return "failed", previous or current_version
+    if is_newer_version(target, current_version):
+        now = time.time() if now is None else now
+        if started_at > 0 and now - started_at < UPDATE_INSTALL_GRACE_SECONDS:
+            return None
+        result = "failed", previous or current_version
+    else:
+        result = "completed", current_version
+    if clear:
+        clear_update_install_marker()
+    return result
 
 
 def should_check_automatically(now: float | None = None) -> bool:

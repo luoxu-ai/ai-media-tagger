@@ -1,4 +1,5 @@
 import hashlib
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -243,7 +244,22 @@ def test_update_completion_marker_is_reported_once(tmp_path):
         assert consume_update_startup_result("1.3.0") is None
 
 
+def test_update_completion_marker_can_be_acknowledged_after_ui_notification(tmp_path):
+    with patch("update_manager.update_storage_directory", return_value=tmp_path):
+        record_update_install_started("1.3.0", "1.2.2")
+        assert consume_update_startup_result("1.3.0", clear=False) == (
+            "completed",
+            "1.3.0",
+        )
+        assert consume_update_startup_result("1.3.0") == ("completed", "1.3.0")
+        assert consume_update_startup_result("1.3.0") is None
+
+
 def test_update_failure_keeps_current_version_available(tmp_path):
     with patch("update_manager.update_storage_directory", return_value=tmp_path):
         record_update_install_started("1.3.0", "1.2.2")
-        assert consume_update_startup_result("1.2.2") == ("failed", "1.2.2")
+        assert consume_update_startup_result("1.2.2") is None
+        assert consume_update_startup_result("1.2.2", now=time.time() + 901) == (
+            "failed",
+            "1.2.2",
+        )

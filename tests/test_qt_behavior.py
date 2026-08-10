@@ -21,6 +21,7 @@ from qt_app import (
     SettingsDialog,
     UpdateDialog,
     FEISHU_CONTACT_URL,
+    FILE_MEDIA_KIND_ROLE,
     FILE_STATUS_KIND_ROLE,
     FILE_STATUS_TEXT_ROLE,
     WINDOWS_APP_USER_MODEL_ID,
@@ -58,6 +59,24 @@ class QtBehaviorTests(unittest.TestCase):
         try:
             self.assertEqual(window.windowTitle(), "AI 媒体标签工具")
             self.assertNotIn("v1.2.1", window.windowTitle())
+        finally:
+            window.close()
+
+    def test_update_completion_marker_is_cleared_after_notice(self):
+        window = MainWindow()
+        try:
+            window._startup_update_result = ("completed", "1.3.0")
+            with patch.object(
+                qt_app.QMessageBox, "information"
+            ) as information, patch(
+                "qt_app.clear_update_install_marker"
+            ) as clear_marker:
+                window._show_startup_update_result()
+            information.assert_called_once_with(
+                window, "更新完成", "软件已成功更新至 v1.3.0。"
+            )
+            clear_marker.assert_called_once_with()
+            self.assertIsNone(window._startup_update_result)
         finally:
             window.close()
 
@@ -827,6 +846,38 @@ class QtBehaviorTests(unittest.TestCase):
                 window._set_file_status(paths[2], "处理失败", "failure")
                 self.assertFalse(any(window.list.item(index).isHidden() for index in range(4)))
                 self.assertFalse(hasattr(window, "status_filter_buttons"))
+            finally:
+                window.close()
+
+    def test_file_rows_show_media_icons_and_keep_status_badges_at_the_tail(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            image = root / "sample.jpg"
+            video = root / "sample.mp4"
+            image.write_bytes(b"image")
+            video.write_bytes(b"video")
+            window = MainWindow()
+            try:
+                window.files = [image, video]
+                window.file_statuses = {
+                    str(image).casefold(): ("鏈娴嬪埌浜虹墿", "skipped"),
+                    str(video).casefold(): ("宸叉湁鏍囩", "success"),
+                }
+                window.refresh({str(image).casefold(), str(video).casefold()})
+
+                image_item = window.list.item(0)
+                video_item = window.list.item(1)
+                self.assertFalse(image_item.icon().isNull())
+                self.assertFalse(video_item.icon().isNull())
+                self.assertNotEqual(
+                    image_item.icon().cacheKey(), video_item.icon().cacheKey()
+                )
+                self.assertEqual(image_item.data(FILE_MEDIA_KIND_ROLE), "image")
+                self.assertEqual(video_item.data(FILE_MEDIA_KIND_ROLE), "video")
+                self.assertEqual(image_item.data(FILE_STATUS_TEXT_ROLE), "鏈娴嬪埌浜虹墿")
+                self.assertEqual(video_item.data(FILE_STATUS_TEXT_ROLE), "宸叉湁鏍囩")
+                self.assertIsNone(window.list.itemWidget(image_item))
+                self.assertIsNone(window.list.itemWidget(video_item))
             finally:
                 window.close()
 
