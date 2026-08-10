@@ -15,7 +15,7 @@ from typing import Iterable
 
 
 APP_NAME = "AI 媒体标签工具"
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.2.6"
 TAG_VALUE = "contains-synthetic-performer"
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".mp4"}
 FILE_RETRY_DELAYS = (0.5, 1.0, 2.0)
