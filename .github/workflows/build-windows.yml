@@ -9,7 +9,7 @@ on:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -64,3 +64,16 @@ jobs:
             dist_installer/AI媒体标签工具安装程序.exe
             dist_installer/SHA256.txt
           if-no-files-found: error
+
+      - name: Upload installer to tagged GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $source = 'dist_installer\AI媒体标签工具安装程序.exe'
+          $installer = 'dist_installer\AI-Media-Tagger-Setup.exe'
+          Copy-Item -LiteralPath $source -Destination $installer -Force
+          $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  AI-Media-Tagger-Setup.exe" | Set-Content -LiteralPath 'dist_installer\SHA256.txt' -Encoding ascii
+          gh release upload "$env:GITHUB_REF_NAME" $installer 'dist_installer\SHA256.txt' --clobber
