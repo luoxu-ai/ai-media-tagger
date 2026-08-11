@@ -1,5 +1,7 @@
 import hashlib
+import json
 import time
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,9 +14,11 @@ from update_manager import (
     UpdateError,
     authenticode_status,
     download_release,
+    fetch_latest_release,
     consume_update_startup_result,
     is_installable_signature_status,
     is_newer_version,
+    launch_installer,
     release_from_payload,
     record_successful_check,
     record_update_install_started,
@@ -36,6 +40,28 @@ def test_only_valid_or_explicitly_unsigned_installers_can_continue():
     assert not is_installable_signature_status("HashMismatch")
     assert not is_installable_signature_status("NotTrusted")
     assert not is_installable_signature_status("UnknownError")
+
+
+def test_installer_targets_the_current_application_directory(tmp_path):
+    installer = tmp_path / "AI-Media-Tagger-Setup.exe"
+    install_directory = tmp_path / "旧版安装目录"
+    with patch("update_manager.subprocess.Popen") as popen:
+        launch_installer(installer, install_directory)
+    arguments = popen.call_args.args[0]
+    assert str(installer) == arguments[0]
+    assert f"/DIR={install_directory.resolve()}" in arguments
+    assert "/CLOSEAPPLICATIONS" in arguments
+
+
+def test_installer_always_recreates_the_desktop_shortcut():
+    script = (Path(__file__).parents[1] / "installer.iss").read_text(
+        encoding="utf-8"
+    )
+    desktop_entry = next(
+        line for line in script.splitlines() if "{autodesktop}" in line
+    )
+    assert "Tasks:" not in desktop_entry
+    assert 'WorkingDir: "{app}"' in desktop_entry
 
 
 def test_authenticode_status_passes_unicode_path_through_environment(monkeypatch):
@@ -162,6 +188,40 @@ class FakeResponse:
         chunk = self.data[self.offset : self.offset + size]
         self.offset += len(chunk)
         return chunk
+
+
+def test_latest_release_retries_a_transient_connection_failure():
+    payload = {
+        "tag_name": "v1.2.7",
+        "body": "更新说明",
+        "html_url": "https://github.com/luoxu-ai/ai-media-tagger/releases/tag/v1.2.7",
+        "assets": [
+            {
+                "name": "AI-Media-Tagger-Setup.exe",
+                "browser_download_url": "https://github.com/luoxu-ai/ai-media-tagger/releases/download/v1.2.7/AI-Media-Tagger-Setup.exe",
+                "digest": f"sha256:{'a' * 64}",
+                "size": 123,
+            }
+        ],
+    }
+    response = FakeResponse(json.dumps(payload).encode("utf-8"))
+    with patch(
+        "update_manager._request",
+        side_effect=[urllib.error.URLError("timed out"), response],
+    ) as request, patch("update_manager.time.sleep"):
+        release = fetch_latest_release(timeout=0.1, attempts=2)
+    assert release.version == "1.2.7"
+    assert request.call_count == 2
+
+
+def test_latest_release_connection_error_is_user_friendly():
+    with patch(
+        "update_manager._request",
+        side_effect=urllib.error.URLError("_ssl handshake timed out"),
+    ), patch("update_manager.time.sleep"), pytest.raises(UpdateError) as error:
+        fetch_latest_release(timeout=0.1, attempts=2)
+    assert "检查网络或代理设置" in str(error.value)
+    assert "_ssl" not in str(error.value)
 
 
 def test_download_verifies_hash_before_publishing_file(tmp_path):

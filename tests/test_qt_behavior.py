@@ -29,6 +29,7 @@ from qt_app import (
     media_file_icon,
     SingleInstanceController,
     configure_windows_app_identity,
+    record_and_detect_version_change,
     single_instance_server_name,
 )
 
@@ -80,6 +81,24 @@ class QtBehaviorTests(unittest.TestCase):
             self.assertIsNone(window._startup_update_result)
         finally:
             window.close()
+
+    def test_version_change_fallback_notifies_only_after_upgrade(self):
+        values = {}
+
+        class FakeSettings:
+            def value(self, key, default=None):
+                return values.get(key, default)
+
+            def setValue(self, key, value):
+                values[key] = value
+
+        with patch("qt_app.QSettings", return_value=FakeSettings()):
+            self.assertIsNone(record_and_detect_version_change("1.2.6"))
+            self.assertIsNone(record_and_detect_version_change("1.2.6"))
+            self.assertEqual(
+                record_and_detect_version_change("1.2.7"),
+                ("completed", "1.2.7"),
+            )
 
     def test_frozen_build_keeps_and_migrates_logs_beside_executable(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -861,8 +880,8 @@ class QtBehaviorTests(unittest.TestCase):
             try:
                 window.files = [image, video]
                 window.file_statuses = {
-                    str(image).casefold(): ("鏈娴嬪埌浜虹墿", "skipped"),
-                    str(video).casefold(): ("宸叉湁鏍囩", "success"),
+                    str(image).casefold(): ("未检测到人物", "skipped"),
+                    str(video).casefold(): ("已有标签", "success"),
                 }
                 window.refresh({str(image).casefold(), str(video).casefold()})
 
@@ -877,8 +896,8 @@ class QtBehaviorTests(unittest.TestCase):
                 )
                 self.assertEqual(image_item.data(FILE_MEDIA_KIND_ROLE), "image")
                 self.assertEqual(video_item.data(FILE_MEDIA_KIND_ROLE), "video")
-                self.assertEqual(image_item.data(FILE_STATUS_TEXT_ROLE), "鏈娴嬪埌浜虹墿")
-                self.assertEqual(video_item.data(FILE_STATUS_TEXT_ROLE), "宸叉湁鏍囩")
+                self.assertEqual(image_item.data(FILE_STATUS_TEXT_ROLE), "未检测到人物")
+                self.assertEqual(video_item.data(FILE_STATUS_TEXT_ROLE), "已有标签")
                 self.assertIsNone(window.list.itemWidget(image_item))
                 self.assertIsNone(window.list.itemWidget(video_item))
             finally:
