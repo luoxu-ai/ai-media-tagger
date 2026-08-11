@@ -1,5 +1,5 @@
 #define MyAppName "AI媒体标签工具"
-#define MyAppVersion "1.2.6"
+#define MyAppVersion "1.2.7"
 #define MyAppPublisher "深圳市艾润特贸易有限公司"
 #define MyAppExeName "AI媒体标签工具.exe"
 
@@ -13,6 +13,7 @@ AppPublisherURL=https://github.com/luoxu-ai/ai-media-tagger
 AppSupportURL=https://github.com/luoxu-ai/ai-media-tagger
 AppUpdatesURL=https://github.com/luoxu-ai/ai-media-tagger/releases
 DefaultDirName={localappdata}\Programs\{#MyAppName}
+UsePreviousAppDir=yes
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
@@ -37,9 +38,6 @@ VersionInfoProductVersion={#MyAppVersion}
 [Languages]
 Name: "chinesesimp"; MessagesFile: "installer_languages\ChineseSimplified.isl"
 
-[Tasks]
-Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加快捷方式："; Flags: unchecked
-
 [Files]
 Source: "dist\{#MyAppName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
@@ -49,7 +47,9 @@ Name: "{app}\卸载程序"; Attribs: hidden
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+; Always recreate the same desktop shortcut during install and online update.
+; This replaces shortcuts that still target an older installation directory.
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
 Name: "{app}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autoprograms}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
 

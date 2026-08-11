@@ -49,7 +49,6 @@ from update_manager import (
     consume_update_startup_result,
     record_update_install_started,
     record_successful_check,
-    should_check_automatically,
 )
 
 
@@ -73,6 +72,17 @@ def show_information_message(parent: QWidget, title: str, text: str) -> None:
     """Show a localized information dialog without a retained focus marker."""
     dialog = QMessageBox(parent)
     dialog.setIcon(QMessageBox.Icon.Information)
+    dialog.setWindowTitle(title)
+    dialog.setText(text)
+    confirm_button = dialog.addButton("确定", QMessageBox.ButtonRole.AcceptRole)
+    confirm_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    dialog.exec()
+
+
+def show_warning_message(parent: QWidget, title: str, text: str) -> None:
+    """Show a localized warning dialog with a Chinese confirmation button."""
+    dialog = QMessageBox(parent)
+    dialog.setIcon(QMessageBox.Icon.Warning)
     dialog.setWindowTitle(title)
     dialog.setText(text)
     confirm_button = dialog.addButton("确定", QMessageBox.ButtonRole.AcceptRole)
@@ -106,6 +116,24 @@ def set_automatic_update_checks_enabled(enabled: bool) -> None:
     QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION).setValue(
         "updates/automatic", enabled
     )
+
+
+def record_and_detect_version_change(
+    current_version: str,
+) -> tuple[str, str] | None:
+    """Remember the running version and report a genuine upgrade once.
+
+    The installer marker remains the primary signal.  This stored-version
+    fallback covers cases where Windows or an older installer loses that
+    marker while replacing the application files.
+    """
+    settings = QSettings(SETTINGS_ORGANIZATION, SETTINGS_APPLICATION)
+    key = "updates/last_started_version"
+    previous_version = str(settings.value(key, "") or "").strip()
+    settings.setValue(key, current_version)
+    if previous_version and is_newer_version(current_version, previous_version):
+        return "completed", current_version
+    return None
 
 
 def selected_theme() -> str:
@@ -1486,7 +1514,13 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._drain_events)
         self.timer.start(80)
-        if getattr(sys, "frozen", False) and should_check_automatically():
+        # Check once on every application start when automatic checks are enabled.
+        # A daily cooldown made newly published releases easy to miss when users
+        # reopened the application after it had already checked earlier that day.
+        if (
+            getattr(sys, "frozen", False)
+            and automatic_update_checks_enabled()
+        ):
             QTimer.singleShot(2500, self._start_update_check)
         if getattr(sys, "frozen", False):
             QTimer.singleShot(900, self._start_environment_check)
@@ -1495,6 +1529,9 @@ class MainWindow(QMainWindow):
             self._startup_update_result = consume_update_startup_result(
                 APP_VERSION, clear=False
             )
+            version_change_result = record_and_detect_version_change(APP_VERSION)
+            if self._startup_update_result is None:
+                self._startup_update_result = version_change_result
             if self._startup_update_result is not None:
                 QTimer.singleShot(1400, self._show_startup_update_result)
 
@@ -1868,7 +1905,7 @@ class MainWindow(QMainWindow):
                 release = fetch_latest_release()
                 record_successful_check()
                 if is_newer_version(release.version, APP_VERSION):
-                    self.events.put(("update_available", release))
+                    self.events.put(("update_available", release, manual))
                 elif manual:
                     self.events.put(("update_current",))
             except UpdateError as exc:
@@ -2113,7 +2150,11 @@ class MainWindow(QMainWindow):
                     self.available_release.version, APP_VERSION
                 )
                 marker_created = True
-            launch_installer(downloaded)
+            # Install into the directory of the currently running application.
+            # This guarantees that online updates replace the executable used
+            # by the existing desktop shortcut instead of creating a second
+            # installation under another default directory.
+            launch_installer(downloaded, Path(sys.executable).resolve().parent)
         except (OSError, UpdateError) as exc:
             if marker_created:
                 clear_update_install_marker()
@@ -2972,12 +3013,14 @@ class MainWindow(QMainWindow):
                         f"发现新版本 v{event[1].version}，点击更新"
                     )
                     self.update_badge.show()
+                    if len(event) > 2 and event[2]:
+                        self.show_update_dialog()
                 elif event[0] == "update_current":
                     show_information_message(
                         self, APP_NAME, f"当前已是最新版本 v{APP_VERSION}。"
                     )
                 elif event[0] == "update_check_error":
-                    QMessageBox.warning(self, APP_NAME, event[1])
+                    show_warning_message(self, APP_NAME, event[1])
                 elif event[0] == "update_check_finished":
                     self._update_check_in_progress = False
                 elif event[0] == "environment_check_done":

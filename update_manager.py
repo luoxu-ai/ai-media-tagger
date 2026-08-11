@@ -135,12 +135,23 @@ def release_from_payload(payload: dict) -> ReleaseInfo:
     )
 
 
-def fetch_latest_release(timeout: float = 10.0) -> ReleaseInfo:
-    try:
-        with _request(LATEST_RELEASE_API, timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (OSError, ValueError, urllib.error.URLError) as exc:
-        raise UpdateError(f"暂时无法连接更新服务器：{exc}") from exc
+def fetch_latest_release(timeout: float = 25.0, attempts: int = 2) -> ReleaseInfo:
+    payload = None
+    last_error: Exception | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            with _request(LATEST_RELEASE_API, timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            break
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            last_error = exc
+            if attempt + 1 < max(1, attempts):
+                time.sleep(0.6)
+    if payload is None:
+        raise UpdateError(
+            "无法连接 GitHub 更新服务器。请检查网络或代理设置后重试；"
+            "这不会影响软件的离线识别和标签处理。"
+        ) from last_error
     if not isinstance(payload, dict):
         raise UpdateError("更新服务器返回了无效数据。")
     return release_from_payload(payload)
@@ -317,20 +328,26 @@ def authenticode_status(path: Path) -> str:
     return result.stdout.strip().splitlines()[-1] if result.stdout.strip() else "UnknownError"
 
 
-def launch_installer(downloaded: Path) -> None:
+def launch_installer(
+    downloaded: Path,
+    install_directory: Path | None = None,
+) -> None:
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
         subprocess, "DETACHED_PROCESS", 0
     )
     try:
+        arguments = [
+            str(downloaded),
+            "/SP-",
+            "/SILENT",
+            "/CLOSEAPPLICATIONS",
+            "/RESTARTAPPLICATIONS",
+            "/CURRENTUSER",
+        ]
+        if install_directory is not None:
+            arguments.append(f"/DIR={Path(install_directory).resolve()}")
         subprocess.Popen(
-            [
-                str(downloaded),
-                "/SP-",
-                "/SILENT",
-                "/CLOSEAPPLICATIONS",
-                "/RESTARTAPPLICATIONS",
-                "/CURRENTUSER",
-            ],
+            arguments,
             close_fds=True,
             creationflags=flags,
         )

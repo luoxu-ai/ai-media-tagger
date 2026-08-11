@@ -17,12 +17,12 @@ VSVersionInfo(
         [
           StringStruct('CompanyName', '深圳市艾润特贸易有限公司'),
           StringStruct('FileDescription', 'AI 媒体标签工具'),
-          StringStruct('FileVersion', '1.2.6'),
+          StringStruct('FileVersion', '1.2.7'),
           StringStruct('InternalName', 'AI媒体标签工具'),
           StringStruct('LegalCopyright', '© 2026 Xu Luo'),
           StringStruct('OriginalFilename', 'AI媒体标签工具.exe'),
           StringStruct('ProductName', 'AI 媒体标签工具'),
-          StringStruct('ProductVersion', '1.2.6')
+          StringStruct('ProductVersion', '1.2.7')
         ]
       )
     ]),
