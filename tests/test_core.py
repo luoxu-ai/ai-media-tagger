@@ -123,7 +123,7 @@ class ServiceTests(unittest.TestCase):
         service = ExifToolService(Path("exiftool.exe"))
         completed = type("Result", (), {"returncode": 0, "stdout": "updated", "stderr": ""})()
         with patch.object(service, "_run", return_value=completed) as run, patch.object(
-            service, "_read_subject", return_value=(True, ["other-keyword"], "")
+            service, "_read_tag_fields", return_value=(True, ["other-keyword"], [], "")
         ):
             result = service.remove_target_subject(Path("demo.jpg"))
         self.assertTrue(result.success)
@@ -131,6 +131,38 @@ class ServiceTests(unittest.TestCase):
         self.assertIn(f"-XMP-dc:Subject-={TAG_VALUE}", arguments)
         self.assertNotIn(f"-XMP-dc:Subject+={TAG_VALUE}", arguments)
         self.assertIn("其他关键词已保留", result.message)
+
+    def test_mp4_writes_windows_category_with_required_trailing_semicolon(self):
+        service = ExifToolService(Path("exiftool.exe"))
+        completed = type("Result", (), {"returncode": 0, "stdout": "updated", "stderr": ""})()
+        with patch.object(service, "_run", return_value=completed) as run, patch.object(
+            service,
+            "_read_tag_fields",
+            side_effect=[
+                (True, [], ["existing"], ""),
+                (True, [TAG_VALUE], ["existing", TAG_VALUE], ""),
+            ],
+        ):
+            result = service.ensure_subject(Path("demo.mp4"), keep_backup=False)
+        self.assertTrue(result.success)
+        arguments = run.call_args.args[0]
+        self.assertIn(
+            f"-Microsoft:Category=existing;{TAG_VALUE};", arguments
+        )
+        self.assertIn(f"-XMP-dc:Subject+={TAG_VALUE}", arguments)
+        self.assertIn(f"-Keys:Keywords+={TAG_VALUE}", arguments)
+
+    def test_mp4_xmp_only_is_not_considered_fully_tagged(self):
+        service = ExifToolService(Path("exiftool.exe"))
+        with patch.object(
+            service,
+            "_read_tag_fields",
+            return_value=(True, [TAG_VALUE], [], ""),
+        ):
+            readable, values, detail = service._read_subject(Path("legacy.mp4"))
+        self.assertTrue(readable)
+        self.assertEqual(values, [])
+        self.assertEqual(detail, "")
 
     def test_batch_removes_target_subject_with_one_write_and_one_verification(self):
         service = ExifToolService(Path("exiftool.exe"))
