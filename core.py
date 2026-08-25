@@ -15,7 +15,7 @@ from typing import Iterable
 
 
 APP_NAME = "AI 媒体标签工具"
-APP_VERSION = "1.2.7"
+APP_VERSION = "1.2.8"
 TAG_VALUE = "contains-synthetic-performer"
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".mp4"}
 FILE_RETRY_DELAYS = (0.5, 1.0, 2.0)
@@ -152,16 +152,52 @@ class ExifToolService:
             creationflags=creationflags, timeout=180, env=env,
         )
 
-    def _read_subject(self, path: Path) -> tuple[bool, list[str], str]:
-        checked = self._run(["-charset", "filename=UTF8", "-j", "-XMP-dc:Subject", str(path)])
+    @staticmethod
+    def _as_list(value: object) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        return [str(value)]
+
+    @staticmethod
+    def _windows_categories(value: object) -> list[str]:
+        """Parse the semicolon-delimited Microsoft Xtra category field."""
+        values = ExifToolService._as_list(value)
+        return [part.strip() for item in values for part in item.split(";") if part.strip()]
+
+    def _read_tag_fields(
+        self, path: Path
+    ) -> tuple[bool, list[str], list[str], str]:
+        args = ["-charset", "filename=UTF8", "-j", "-XMP-dc:Subject"]
+        if path.suffix.casefold() == ".mp4":
+            args.append("-Microsoft:Category")
+        args.append(str(path))
+        checked = self._run(args)
         if checked.returncode != 0:
             detail = (checked.stderr or checked.stdout).strip()
-            return False, [], detail or "ExifTool 读取失败"
+            return False, [], [], detail or "ExifTool 读取失败"
         data = json.loads(checked.stdout)
-        value = data[0].get("Subject") if data else None
-        if value is None:
-            return True, [], ""
-        return True, value if isinstance(value, list) else [value], ""
+        item = data[0] if data else {}
+        return (
+            True,
+            self._as_list(item.get("Subject")),
+            self._windows_categories(item.get("Category")),
+            "",
+        )
+
+    def _read_subject(self, path: Path) -> tuple[bool, list[str], str]:
+        readable, subjects, categories, detail = self._read_tag_fields(path)
+        if not readable:
+            return False, [], detail
+        # An MP4 is considered fully tagged only when both the portable XMP
+        # field and Windows Explorer's Microsoft Xtra field contain the tag.
+        # This also migrates older MP4 exports that had XMP only.
+        if path.suffix.casefold() == ".mp4" and not (
+            TAG_VALUE in subjects and TAG_VALUE in categories
+        ):
+            subjects = [value for value in subjects if value != TAG_VALUE]
+        return True, subjects, ""
 
     def read_subjects(
         self, paths: Iterable[Path]
@@ -173,6 +209,7 @@ class ExifToolService:
         try:
             checked = self._run([
                 "-charset", "filename=UTF8", "-j", "-XMP-dc:Subject",
+                "-Microsoft:Category",
                 *(str(path) for path in ordered),
             ])
             data = json.loads(checked.stdout)
@@ -184,8 +221,11 @@ class ExifToolService:
                 if error:
                     results[str(path).casefold()] = (False, [], error)
                     continue
-                value = item.get("Subject")
-                values = value if isinstance(value, list) else ([] if value is None else [value])
+                values = self._as_list(item.get("Subject"))
+                if path.suffix.casefold() == ".mp4":
+                    categories = self._windows_categories(item.get("Category"))
+                    if not (TAG_VALUE in values and TAG_VALUE in categories):
+                        values = [value for value in values if value != TAG_VALUE]
                 results[str(path).casefold()] = (True, values, "")
             return results
         except (OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired):
@@ -235,8 +275,23 @@ class ExifToolService:
             args.extend([
                 f"-XMP-dc:Subject-={TAG_VALUE}",
                 f"-XMP-dc:Subject+={TAG_VALUE}",
-                str(path),
             ])
+            if path.suffix.casefold() == ".mp4":
+                readable, _subjects, categories, detail = self._read_tag_fields(path)
+                if not readable:
+                    return TagResult(path, False, f"写入前读取视频标签失败：{detail}")
+                categories = [value for value in categories if value != TAG_VALUE]
+                categories.append(TAG_VALUE)
+                # Windows Explorer only exposes MP4 tags when the Microsoft
+                # Xtra Category string is semicolon-delimited *and* terminated
+                # by a semicolon. Keys:Keywords is also written for other
+                # QuickTime-aware applications.
+                args.extend([
+                    f"-Keys:Keywords-={TAG_VALUE}",
+                    f"-Keys:Keywords+={TAG_VALUE}",
+                    f"-Microsoft:Category={';'.join(categories)};",
+                ])
+            args.append(str(path))
             written = self._run(args)
             if written.returncode != 0:
                 detail = (written.stderr or written.stdout).strip()
@@ -245,7 +300,10 @@ class ExifToolService:
             if not readable:
                 return TagResult(path, False, f"已写入，但验证失败：{detail}")
             if TAG_VALUE in values:
-                return TagResult(path, True, "标签已追加并验证")
+                message = "标签已追加并验证"
+                if path.suffix.casefold() == ".mp4":
+                    message = "视频标签已写入并通过 Windows 兼容性验证"
+                return TagResult(path, True, message)
             return TagResult(path, False, f"验证时未找到目标标签，当前值：{values!r}")
         except subprocess.TimeoutExpired:
             return TagResult(path, False, "处理超时（180 秒）")
@@ -260,19 +318,30 @@ class ExifToolService:
         if not ordered:
             return {}
         try:
+            videos = [path for path in ordered if path.suffix.casefold() == ".mp4"]
+            batch_paths = [path for path in ordered if path.suffix.casefold() != ".mp4"]
+            results: dict[str, TagResult] = {}
+            # MP4 needs a per-file Microsoft Xtra Category value so existing
+            # user categories can be preserved. Images retain the fast batch
+            # path below.
+            for path in videos:
+                results[str(path).casefold()] = self.ensure_subject(
+                    path, keep_backup=keep_backup
+                )
+            if not batch_paths:
+                return results
             args = ["-charset", "filename=UTF8"]
             if not keep_backup:
                 args.append("-overwrite_original")
             args.extend([
                 f"-XMP-dc:Subject-={TAG_VALUE}",
                 f"-XMP-dc:Subject+={TAG_VALUE}",
-                *(str(path) for path in ordered),
+                *(str(path) for path in batch_paths),
             ])
             written = self._run(args)
             write_detail = (written.stderr or written.stdout).strip()
-            states = self.read_subjects(ordered)
-            results: dict[str, TagResult] = {}
-            for path in ordered:
+            states = self.read_subjects(batch_paths)
+            for path in batch_paths:
                 key = str(path).casefold()
                 readable, values, detail = states[key]
                 if readable and TAG_VALUE in values:
@@ -289,7 +358,7 @@ class ExifToolService:
             # Retry only failed files individually. This handles short-lived
             # locks from antivirus, Explorer previews and cloud-sync clients
             # without slowing down successful batch items.
-            for path in ordered:
+            for path in batch_paths:
                 key = str(path).casefold()
                 if results[key].success:
                     continue
@@ -314,18 +383,29 @@ class ExifToolService:
         last_result = TagResult(path, False, "标签移除未执行")
         for attempt in range(len(FILE_RETRY_DELAYS) + 1):
             try:
-                written = self._run([
+                args = [
                     "-charset", "filename=UTF8", "-overwrite_original",
-                    f"-XMP-dc:Subject-={TAG_VALUE}", str(path),
-                ])
+                    f"-XMP-dc:Subject-={TAG_VALUE}",
+                ]
+                if path.suffix.casefold() == ".mp4":
+                    readable, _subjects, categories, detail = self._read_tag_fields(path)
+                    if not readable:
+                        return TagResult(path, False, f"移除前读取视频标签失败：{detail}")
+                    categories = [value for value in categories if value != TAG_VALUE]
+                    args.extend([
+                        f"-Keys:Keywords-={TAG_VALUE}",
+                        f"-Microsoft:Category={';'.join(categories) + ';' if categories else ''}",
+                    ])
+                args.append(str(path))
+                written = self._run(args)
                 if written.returncode != 0:
                     detail = (written.stderr or written.stdout).strip()
                     last_result = TagResult(path, False, detail or "ExifTool 移除标签失败")
                 else:
-                    readable, values, detail = self._read_subject(path)
+                    readable, subjects, categories, detail = self._read_tag_fields(path)
                     if not readable:
                         last_result = TagResult(path, False, f"标签移除后验证失败：{detail}")
-                    elif TAG_VALUE in values:
+                    elif TAG_VALUE in subjects or TAG_VALUE in categories:
                         last_result = TagResult(path, False, "验证时目标标签仍然存在")
                     else:
                         return TagResult(path, True, "目标标签已移除并验证；其他关键词已保留")
@@ -346,15 +426,21 @@ class ExifToolService:
         if not ordered:
             return {}
         try:
+            videos = [path for path in ordered if path.suffix.casefold() == ".mp4"]
+            batch_paths = [path for path in ordered if path.suffix.casefold() != ".mp4"]
+            results: dict[str, TagResult] = {
+                str(path).casefold(): self.remove_target_subject(path) for path in videos
+            }
+            if not batch_paths:
+                return results
             written = self._run([
                 "-charset", "filename=UTF8", "-overwrite_original",
                 f"-XMP-dc:Subject-={TAG_VALUE}",
-                *(str(path) for path in ordered),
+                *(str(path) for path in batch_paths),
             ])
             write_detail = (written.stderr or written.stdout).strip()
-            states = self.read_subjects(ordered)
-            results: dict[str, TagResult] = {}
-            for path in ordered:
+            states = self.read_subjects(batch_paths)
+            for path in batch_paths:
                 key = str(path).casefold()
                 readable, values, detail = states[key]
                 if readable and TAG_VALUE not in values:
@@ -374,7 +460,7 @@ class ExifToolService:
 
             # Preserve fault isolation for files temporarily locked by
             # Explorer, antivirus or sync software.
-            for path in ordered:
+            for path in batch_paths:
                 key = str(path).casefold()
                 if results[key].success:
                     continue
