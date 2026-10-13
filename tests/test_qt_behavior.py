@@ -692,11 +692,15 @@ class QtBehaviorTests(unittest.TestCase):
             window.uncheck_all()
             uncheck_elapsed = time.perf_counter() - started
             self.assertEqual(window.count.text(), "已选择：0 / 2000 个文件")
+            self.assertEqual(len(window.list.selectedItems()), 0)
 
             started = time.perf_counter()
             window.check_all()
             check_elapsed = time.perf_counter() - started
             self.assertEqual(window.count.text(), "已选择：2000 / 2000 个文件")
+            self.assertEqual(len(window.list.selectedItems()), 2000)
+            self.assertTrue(window.list.updatesEnabled())
+            self.assertFalse(window.list.signalsBlocked())
             self.assertLess(uncheck_elapsed, 2.0)
             self.assertLess(check_elapsed, 2.0)
         finally:

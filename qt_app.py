@@ -2504,14 +2504,22 @@ class MainWindow(QMainWindow):
 
     def _set_all_checked(self, state: Qt.CheckState):
         """Update every row in one batch instead of recounting after each item."""
-        self.list.blockSignals(True)
+        previously_blocked = self.list.blockSignals(True)
+        previously_updating = self.list.updatesEnabled()
+        self.list.setUpdatesEnabled(False)
         try:
+            # Removing one selected row at a time fragments Qt's selection
+            # ranges and can become quadratic on Windows. Clear/select the
+            # whole range once, independently from the checkbox data.
+            self.list.clearSelection()
             for index in range(self.list.count()):
                 item = self.list.item(index)
                 item.setCheckState(state)
-                item.setSelected(state == Qt.Checked)
+            if state == Qt.Checked:
+                self.list.selectAll()
         finally:
-            self.list.blockSignals(False)
+            self.list.blockSignals(previously_blocked)
+            self.list.setUpdatesEnabled(previously_updating)
         self.update_checked_count()
         self._schedule_session_save()
 
