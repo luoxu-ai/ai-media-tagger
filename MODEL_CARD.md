@@ -7,8 +7,16 @@
 - Purpose: high-recall offline detection of people in ecommerce media.
 - Base model: D-FINE-M COCO pretrained weights.
 - Fine-tuning: a small, manually reviewed private ecommerce image dataset.
-- Output used by the application: the `person` class. Hand/arm and foot/leg
-  classes are ignored by the current application logic.
+- Output used by the application: the `person`, hand/arm and foot/leg classes.
+  From 2026-10-13, clearly detected standalone limbs also qualify for tagging.
+  Direct limb acceptance requires confidence >= 0.60 and a bounding box area
+  >= 0.3% of the original image. These thresholds are configurable.
+  Overlapping crop detections are measured against the original image area,
+  rather than the enlarged crop. Tiny localized limbs cannot bypass the area
+  limit through image-level classification.
+  Image-level fallback requires spatial evidence at confidence >= 0.30 and
+  the same minimum original-image area; a classifier score alone is insufficient.
+  The thresholds concern detection boxes, not exact exposed-skin pixel counts.
 - License for this published fine-tuned weight: Apache License 2.0.
 
 ### `face_detection_yunet_2023mar.onnx`

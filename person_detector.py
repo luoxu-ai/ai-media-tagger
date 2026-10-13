@@ -24,10 +24,11 @@ PERSON_LABEL = 0
 PART_LABELS = {1, 2}
 PART_SUPPRESSION_THRESHOLD = 0.50
 PART_SUPPRESSION_IOU = 0.55
-STANDALONE_PART_VETO_THRESHOLD = 0.85
-STANDALONE_PART_VERIFIER_MAX = 0.40
+PART_DETECTION_THRESHOLD = 0.60
+MIN_PART_AREA_RATIO = 0.003
+FALLBACK_LOCALIZATION_THRESHOLD = 0.30
 MULTI_PERSON_CONFIRMATION_COUNT = 2
-DETECTION_CACHE_VERSION = "20260729-small-person-v2"
+DETECTION_CACHE_VERSION = "20261013-visible-body-parts-v1"
 MODEL_VERSION = "2026.07.29-v2"
 MODEL_RELEASE_DATE = "2026-07-29"
 MODEL_RUNTIME = "CPU 离线识别"
@@ -59,6 +60,11 @@ class PersonEvidence:
     max_area_ratio: float = 0.0
     candidate_count: int = 0
     part_confidence: float = 0.0
+    part_area_ratio: float = 0.0
+    visible_part_confidence: float = 0.0
+    visible_part_area_ratio: float = 0.0
+    visible_part_label: int = -1
+    localized_area_ratio: float = 0.0
 
 
 class ModelUnavailableError(RuntimeError):
@@ -203,7 +209,9 @@ def _tiles(image: Image.Image) -> Iterable[Image.Image]:
     starts_y = (0, max(0, height - tile_height))
     for top in starts_y:
         for left in starts_x:
-            yield image.crop((left, top, left + tile_width, top + tile_height))
+            tile = image.crop((left, top, left + tile_width, top + tile_height))
+            tile.info["_tagger_original_size"] = image.info.get("_tagger_original_size", image.size)
+            yield tile
 
 
 class PersonDetector:
@@ -222,6 +230,8 @@ class PersonDetector:
         enable_tiles: bool = True,
         tile_trigger_threshold: float = 0.08,
         cache_path: Path | None = None,
+        part_detection_threshold: float = PART_DETECTION_THRESHOLD,
+        min_part_area_ratio: float = MIN_PART_AREA_RATIO,
     ) -> None:
         self.detection_threshold = detection_threshold
         self.face_threshold = face_threshold
@@ -233,6 +243,10 @@ class PersonDetector:
         self.human_confirmation_threshold = human_confirmation_threshold
         self.enable_tiles = enable_tiles
         self.tile_trigger_threshold = tile_trigger_threshold
+        if not 0 < part_detection_threshold <= 1 or not 0 <= min_part_area_ratio <= 1:
+            raise ValueError("肢体识别置信度或面积阈值不合法")
+        self.part_detection_threshold = part_detection_threshold
+        self.min_part_area_ratio = min_part_area_ratio
         detector_path, face_path, presence_path, verifier_path = (
             bundled_path(relative) for relative in MODEL_RELATIVE_PATHS
         )
@@ -243,7 +257,8 @@ class PersonDetector:
             f"{self.verifier_threshold:.3f}:{self.human_confirmation_threshold:.3f}:"
             f"{self.tile_trigger_threshold:.3f}:"
             f"{self.image_level_local_check_below:.3f}:"
-            f"{self.image_level_local_threshold:.3f}"
+            f"{self.image_level_local_threshold:.3f}:"
+            f"part={self.part_detection_threshold:.6f}:area={self.min_part_area_ratio:.6f}"
         ) if verifier_path.is_file() else DETECTION_CACHE_VERSION
         self.cache_path = cache_path or self._default_cache_path()
         self._cache: dict[str, dict] = self._load_cache()
@@ -414,20 +429,28 @@ class PersonDetector:
         labels = np.asarray(labels).reshape(-1)
         boxes = np.asarray(boxes).reshape(-1, 4)
         scores = np.asarray(scores).reshape(-1)
+        original_width, original_height = image.info.get("_tagger_original_size", image.size)
+        crop_fraction = image.width * image.height / (original_width * original_height)
+        localized_area_ratio = 0.0
         person_candidates: list[
             tuple[float, tuple[float, float, float, float]]
         ] = []
         part_candidates: list[
-            tuple[float, tuple[float, float, float, float]]
+            tuple[float, tuple[float, float, float, float], int]
         ] = []
         for label, box, score in zip(labels, boxes, scores):
             score = float(score)
             label = int(label)
             normalized_box = _clamp_box(box)
+            if label in ({PERSON_LABEL} | PART_LABELS) and score >= FALLBACK_LOCALIZATION_THRESHOLD:
+                localized_area_ratio = max(
+                    localized_area_ratio,
+                    _box_area(normalized_box) / (640.0 * 640.0) * crop_fraction,
+                )
             if label == PERSON_LABEL and score >= self.detection_threshold:
                 person_candidates.append((score, normalized_box))
             elif label in PART_LABELS and score >= PART_SUPPRESSION_THRESHOLD:
-                part_candidates.append((score, normalized_box))
+                part_candidates.append((score, normalized_box, label))
 
         confidence = 0.0
         max_area_ratio = 0.0
@@ -436,7 +459,7 @@ class PersonDetector:
             is_body_part_duplicate = any(
                 part_score > score
                 and _box_iou(box, part_box) >= PART_SUPPRESSION_IOU
-                for part_score, part_box in part_candidates
+                for part_score, part_box, _label in part_candidates
             )
             if is_body_part_duplicate:
                 continue
@@ -444,8 +467,20 @@ class PersonDetector:
             confidence = max(confidence, score)
             max_area_ratio = max(max_area_ratio, area_ratio)
             count += 1
-        part_confidence = max((score for score, _box in part_candidates), default=0.0)
-        return PersonEvidence(confidence, max_area_ratio, count, part_confidence)
+        parts = [(score, _box_area(box) / (640.0 * 640.0) * crop_fraction, label)
+                 for score, box, label in part_candidates]
+        visible_parts = [(score, area, label) for score, area, label in parts
+                         if score >= getattr(self, "part_detection_threshold", PART_DETECTION_THRESHOLD)
+                         and area >= getattr(self, "min_part_area_ratio", MIN_PART_AREA_RATIO)]
+        visible_score, visible_area, visible_label = max(visible_parts, default=(0.0, 0.0, -1))
+        return PersonEvidence(
+            confidence=confidence, max_area_ratio=max_area_ratio, candidate_count=count,
+            part_confidence=max((score for score, _area, _label in parts), default=0.0),
+            part_area_ratio=max((area for _score, area, _label in parts), default=0.0),
+            visible_part_confidence=visible_score, visible_part_area_ratio=visible_area,
+            visible_part_label=visible_label,
+            localized_area_ratio=localized_area_ratio,
+        )
 
     def _person_score(self, image: Image.Image) -> float:
         return self._person_evidence(image).confidence
@@ -509,6 +544,17 @@ class PersonDetector:
             return True, face_score, f"{prefix}检测到人脸或侧脸"
 
         person = self._person_evidence(image)
+        visible_part_score = getattr(person, "visible_part_confidence", 0.0)
+        if visible_part_score > 0:
+            area = getattr(person, "visible_part_area_ratio", 0.0)
+            label = getattr(person, "visible_part_label", -1)
+            part_name = {1: "手部", 2: "脚部"}.get(label, "肢体")
+            self._last_stage_details = (
+                f"人脸={face_score:.3f}；肢体={visible_part_score:.3f}；"
+                f"原图肢体面积={area:.4%}（通过）"
+            )
+            prefix = "分块复检" if tiled else ""
+            return True, visible_part_score, f"{prefix}检测到可见{part_name}，占原图面积 {area:.2%}"
         if person.confidence > 0.0:
             if (
                 not tiled
@@ -534,19 +580,32 @@ class PersonDetector:
             )
             prefix = "分块复检" if tiled else ""
             return True, person.confidence, f"{prefix}检测到人物、侧身、背影或人体区域"
+        # A global person classifier has no bounding box. Do not let it override
+        # explicitly localized tiny/uncertain limbs. Other real people/faces
+        # already passed above; additional views are still evaluated by detect().
+        if getattr(person, "part_confidence", 0.0) > 0:
+            self._last_stage_details = (
+                f"人脸={face_score:.3f}；人物框=0.000；"
+                f"肢体={person.part_confidence:.3f}；"
+                f"原图肢体面积={getattr(person, 'part_area_ratio', 0.0):.4%}"
+                "（面积或置信度未达标，未通过）"
+            )
+            return False, max(face_score, person.part_confidence), ""
         presence_score = 0.0 if tiled else self._presence_score(image)
+        if not tiled and getattr(person, "localized_area_ratio", 0.0) < getattr(
+            self, "min_part_area_ratio", MIN_PART_AREA_RATIO
+        ):
+            self._last_stage_details = (
+                f"人脸={face_score:.3f}；人物框=0.000；图像初筛={presence_score:.3f}；"
+                "缺少达到原图面积阈值的人体定位证据（未通过）"
+            )
+            return False, max(face_score, presence_score), ""
         if presence_score >= getattr(self, "presence_threshold", 0.12):
             verifier_score = self._verifier_score(image)
             self._last_stage_details = (
                 f"人脸={face_score:.3f}；人物框=0.000；图像初筛={presence_score:.3f}；"
                 f"复检={verifier_score:.3f}"
             )
-            if (
-                getattr(person, "part_confidence", 0.0)
-                >= STANDALONE_PART_VETO_THRESHOLD
-                and verifier_score < STANDALONE_PART_VERIFIER_MAX
-            ):
-                return False, max(person.part_confidence, presence_score), ""
             if verifier_score >= getattr(self, "verifier_threshold", 0.35):
                 local_check_below = getattr(
                     self, "image_level_local_check_below", None
@@ -580,6 +639,7 @@ class PersonDetector:
         try:
             with Image.open(path) as opened:
                 image = ImageOps.exif_transpose(opened).convert("RGB")
+                image.info["_tagger_original_size"] = image.size
         except Exception as exc:
             return DetectionResult(
                 False,
@@ -618,7 +678,7 @@ class PersonDetector:
         result = DetectionResult(
             False,
             best_score,
-            "未检测到人脸、侧脸、人物或背影；未导出",
+            "未检测到人物或达到面积阈值的肢体；未导出",
             time.perf_counter() - started,
             passes,
             details=getattr(self, "_last_stage_details", ""),

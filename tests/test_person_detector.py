@@ -45,7 +45,7 @@ def test_presence_verifier_can_confirm_a_person_when_box_models_do_not():
     detector.presence_threshold = 0.14
     detector._face_score = lambda image: 0.0
     detector._person_evidence = lambda image: type(
-        "Evidence", (), {"confidence": 0.0, "max_area_ratio": 0.0, "candidate_count": 0}
+        "Evidence", (), {"confidence": 0.0, "max_area_ratio": 0.0, "candidate_count": 0, "localized_area_ratio": 0.02}
     )()
     detector._presence_score = lambda image: 0.80
 
@@ -63,7 +63,7 @@ def test_second_stage_verifier_rejects_a_weak_image_level_false_positive():
     detector.verifier_threshold = 0.025
     detector._face_score = lambda image: 0.0
     detector._person_evidence = lambda image: type(
-        "Evidence", (), {"confidence": 0.0, "max_area_ratio": 0.0, "candidate_count": 0}
+        "Evidence", (), {"confidence": 0.0, "max_area_ratio": 0.0, "candidate_count": 0, "localized_area_ratio": 0.02}
     )()
     detector._presence_score = lambda image: 0.80
     detector._verifier_score = lambda image: 0.01
@@ -81,7 +81,7 @@ def test_second_stage_verifier_keeps_a_reviewed_positive():
     detector.verifier_threshold = 0.025
     detector._face_score = lambda image: 0.0
     detector._person_evidence = lambda image: type(
-        "Evidence", (), {"confidence": 0.0, "max_area_ratio": 0.0, "candidate_count": 0}
+        "Evidence", (), {"confidence": 0.0, "max_area_ratio": 0.0, "candidate_count": 0, "localized_area_ratio": 0.02}
     )()
     detector._presence_score = lambda image: 0.80
     detector._verifier_score = lambda image: 0.03
@@ -123,7 +123,7 @@ def test_uncertain_image_level_result_keeps_local_person_evidence():
     assert score == 0.15
 
 
-def test_high_confidence_standalone_hand_vetoes_image_level_fallback():
+def test_unqualified_standalone_hand_cannot_use_image_level_fallback():
     detector = PersonDetector.__new__(PersonDetector)
     detector.face_threshold = 0.92
     detector._face_score = lambda image: 0.0
@@ -147,7 +147,7 @@ def test_high_confidence_standalone_hand_vetoes_image_level_fallback():
     assert reason == ""
 
 
-def test_lower_confidence_part_does_not_veto_reviewed_person_fallback():
+def test_qualified_part_is_accepted_without_person_classifier_confirmation():
     detector = PersonDetector.__new__(PersonDetector)
     detector.face_threshold = 0.92
     detector.presence_threshold = 0.12
@@ -159,6 +159,9 @@ def test_lower_confidence_part_does_not_veto_reviewed_person_fallback():
             "max_area_ratio": 0.0,
             "candidate_count": 0,
             "part_confidence": 0.77,
+            "visible_part_confidence": 0.77,
+            "visible_part_area_ratio": 0.02,
+            "visible_part_label": 1,
         }
     )()
     detector._presence_score = lambda image: 0.80
@@ -169,7 +172,7 @@ def test_lower_confidence_part_does_not_veto_reviewed_person_fallback():
     assert detected
 
 
-def test_strong_verifier_keeps_person_even_with_high_part_confidence():
+def test_strong_person_classifier_cannot_override_tiny_part():
     detector = PersonDetector.__new__(PersonDetector)
     detector.face_threshold = 0.92
     detector.presence_threshold = 0.12
@@ -188,7 +191,7 @@ def test_strong_verifier_keeps_person_even_with_high_part_confidence():
 
     detected, _score, _reason = detector._evaluate_view(Image.new("RGB", (640, 640)))
 
-    assert detected
+    assert not detected
 
 
 def test_mp4_is_directly_accepted_without_model_inference(tmp_path):
@@ -258,7 +261,7 @@ def test_unreadable_image_is_reported_as_error(tmp_path):
     assert "图片读取失败" in result.reason
 
 
-def test_hands_and_feet_never_trigger_even_when_large():
+def test_large_hands_and_feet_are_positive_part_evidence_not_person_boxes():
     class FakeSession:
         def __init__(self, label):
             self.label = label
@@ -275,8 +278,12 @@ def test_hands_and_feet_never_trigger_even_when_large():
     image = Image.new("RGB", (640, 640), "white")
     detector.session = FakeSession(1)
     assert detector._person_score(image) == 0.0
+    assert detector._person_evidence(image).visible_part_confidence > 0.98
+    assert detector._person_evidence(image).visible_part_label == 1
     detector.session = FakeSession(2)
     assert detector._person_score(image) == 0.0
+    assert detector._person_evidence(image).visible_part_confidence > 0.98
+    assert detector._person_evidence(image).visible_part_label == 2
 
 
 def test_person_is_accepted_at_high_recall_threshold():

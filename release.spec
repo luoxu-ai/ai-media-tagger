@@ -40,6 +40,10 @@ a = Analysis(
 # entries do not affect detection models or media metadata support.
 def keep_runtime_entry(entry):
     target = str(entry[0]).replace('\\', '/').casefold()
+    # Windows Qt links to the OS ICU API. An unrelated ICU from PATH (e.g.
+    # Poppler's version-suffixed build) shadows it and breaks QtCore imports.
+    if target == 'icuuc.dll' or target.startswith('icudt') and target.endswith('.dll'):
+        return False
     if 'cv2/opencv_videoio_ffmpeg' in target:
         return False
     if target.endswith('pyside6/opengl32sw.dll'):

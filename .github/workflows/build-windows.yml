@@ -38,6 +38,11 @@ jobs:
         shell: pwsh
         run: .\build.ps1
 
+      - name: Verify packaged startup, detection and tag export
+        shell: pwsh
+        run: |
+          .\.train_venv\Scripts\python.exe .\tools\verify_packaged_app.py --exe 'dist\AI媒体标签工具\AI媒体标签工具.exe' --workdir "$env:RUNNER_TEMP\ai-media-tagger-smoke"
+
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --yes --no-progress
