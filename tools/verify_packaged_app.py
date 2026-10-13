@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 
@@ -16,6 +17,14 @@ def verify(exe: Path, workdir: Path) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="packaged-smoke-", dir=workdir) as directory:
         root = Path(directory)
+        # ExifTool's Windows Perl launcher uses the system ANSI code page for
+        # its support-directory path. English CI runners cannot open the
+        # Chinese build-output name. Test an unchanged copy from RUNNER_TEMP,
+        # whose path is ASCII, rather than depending on the runner's locale.
+        application = root / "app"
+        shutil.copytree(exe.parent, application)
+        test_exe = application / "app.exe"
+        shutil.copy2(application / exe.name, test_exe)
         source = root / "blank.jpg"
         Image.new("RGB", (1000, 1000), "white").save(source)
         original_hash = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -35,7 +44,7 @@ def verify(exe: Path, workdir: Path) -> None:
             startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             startup.wShowWindow = 0
             completed = subprocess.run(
-                [str(exe)], cwd=exe.parent, env=environment, timeout=90,
+                [str(test_exe)], cwd=application, env=environment, timeout=90,
                 creationflags=subprocess.CREATE_NO_WINDOW, startupinfo=startup,
             )
             if completed.returncode != 0 or not report.is_file():
